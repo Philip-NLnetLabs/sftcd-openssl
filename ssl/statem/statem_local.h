@@ -572,4 +572,3 @@ int ech_map_ext_type_to_ind(unsigned int type);
 int ssl_cipher_list_to_bytes(SSL_CONNECTION *s, STACK_OF(SSL_CIPHER) *sk,
                                     WPACKET *pkt);
 #endif
-
