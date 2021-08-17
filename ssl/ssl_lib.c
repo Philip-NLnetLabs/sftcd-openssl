@@ -902,6 +902,10 @@ SSL *ossl_ssl_connection_new(SSL_CTX *ctx)
             if (s->ech->outer_name == NULL)
                 goto err;
         }
+        if (s->ech && s->ech->cfg && s->ech->cfg->recs) 
+            s->ext.ech_attempted_type=s->ech->cfg->recs[0].version;
+        else
+            s->ext.ech_attempted_type=TLSEXT_TYPE_ech_unknown;
     } else {
         s->ech=NULL;
     }
@@ -916,6 +920,7 @@ SSL *ossl_ssl_connection_new(SSL_CTX *ctx)
     s->ext.ech_grease=0;
     s->ext.ech_grease_suite=NULL;
     s->ext.ch_depth=0;
+    s->ext.encoded_innerch_len=0;
     if (ctx->options & SSL_OP_ECH_GREASE) { 
         s->ext.ech_grease=ECH_IS_GREASE;
     } else {
