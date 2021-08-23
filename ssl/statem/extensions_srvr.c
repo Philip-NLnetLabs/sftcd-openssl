@@ -1959,7 +1959,7 @@ EXT_RETURN tls_construct_stoc_psk(SSL_CONNECTION *s, WPACKET *pkt,
 #ifndef OPENSSL_NO_ECH
 /**
  * @brief ECH handling for edge cases (GREASE) and errors.
- * 
+ *
  * The real ECH handling (i.e. decryption) happens before
  * but if that failed (e.g. decryption failed) then we will
  * end up here, processing the outer CH so we need to have
@@ -2018,11 +2018,11 @@ EXT_RETURN tls_construct_stoc_ech(SSL_CONNECTION *s, WPACKET *pkt,
     }
     /*
      * If the client GREASEd, or we think it did, we
-     * return the first-loaded ECHConfig, as the value 
+     * return the first-loaded ECHConfig, as the value
      * of the extension.
      */
     if (s->ech==NULL || s->ech->cfg==NULL) {
-        OSSL_TRACE_BEGIN(TLS) { 
+        OSSL_TRACE_BEGIN(TLS) {
             BIO_printf(trc_out,
                 "ECH - not sending ECHConfigs back to client even though " \
                 "they GREASE'd as I've no loaded configs\n");
@@ -2030,7 +2030,7 @@ EXT_RETURN tls_construct_stoc_ech(SSL_CONNECTION *s, WPACKET *pkt,
         return EXT_RETURN_NOT_SENT;
     }
     if (s->ech->cfg->encoded==NULL || s->ech->cfg->encoded_len==0) {
-        OSSL_TRACE_BEGIN(TLS) { 
+        OSSL_TRACE_BEGIN(TLS) {
             BIO_printf(trc_out,
                 "ECH - not sending ECHConfigs back to client even though " \
                 "they GREASE'd as I've a busted config loaded\n");
@@ -2038,15 +2038,16 @@ EXT_RETURN tls_construct_stoc_ech(SSL_CONNECTION *s, WPACKET *pkt,
         return EXT_RETURN_NOT_SENT;
     }
     if (s->ext.ech_attempted_type==ECH_DRAFT_10_VERSION) {
-        if (!WPACKET_put_bytes_u16(pkt, TLSEXT_TYPE_ech) 
-            || !WPACKET_sub_memcpy_u16(pkt, 
+        if (!WPACKET_put_bytes_u16(pkt, TLSEXT_TYPE_ech)
+            || !WPACKET_sub_memcpy_u16(pkt,
                         s->ech->cfg->encoded, s->ech->cfg->encoded_len)
                 ) {
             SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
             return 0;
         }
-        OSSL_TRACE_BEGIN(TLS) { 
-            BIO_printf(trc_out,"sending 1st loaded ECHConfig (draft-10) back to client\n");
+        OSSL_TRACE_BEGIN(TLS) {
+            BIO_printf(trc_out,"sending 1st loaded ECHConfig (draft-10) back " \
+                               "to client\n");
         } OSSL_TRACE_END(TLS);
         return EXT_RETURN_SENT;
     }
@@ -2072,11 +2073,11 @@ EXT_RETURN tls_construct_stoc_ech13(SSL *s, WPACKET *pkt,
     }
     /*
      * If the client GREASEd, or we think it did, we
-     * return the first-loaded ECHConfig, as the value 
+     * return the first-loaded ECHConfig, as the value
      * of the extension.
      */
     if (s->ech==NULL || s->ech->cfg==NULL) {
-        OSSL_TRACE_BEGIN(TLS) { 
+        OSSL_TRACE_BEGIN(TLS) {
             BIO_printf(trc_out,
                 "ECH - not sending ECHConfigs back to client even though " \
                 "they GREASE'd as I've no loaded configs\n");
@@ -2084,7 +2085,7 @@ EXT_RETURN tls_construct_stoc_ech13(SSL *s, WPACKET *pkt,
         return EXT_RETURN_NOT_SENT;
     }
     if (s->ech->cfg->encoded==NULL || s->ech->cfg->encoded_len==0) {
-        OSSL_TRACE_BEGIN(TLS) { 
+        OSSL_TRACE_BEGIN(TLS) {
             BIO_printf(trc_out,
                 "ECH - not sending ECHConfigs back to client even though " \
                 "they GREASE'd as I've a busted config loaded\n");
@@ -2092,15 +2093,16 @@ EXT_RETURN tls_construct_stoc_ech13(SSL *s, WPACKET *pkt,
         return EXT_RETURN_NOT_SENT;
     }
     if (s->ext.ech_attempted_type==ECH_DRAFT_13_VERSION) {
-        if (!WPACKET_put_bytes_u16(pkt, TLSEXT_TYPE_ech13) 
-            || !WPACKET_sub_memcpy_u16(pkt, 
+        if (!WPACKET_put_bytes_u16(pkt, TLSEXT_TYPE_ech13)
+            || !WPACKET_sub_memcpy_u16(pkt,
                         s->ech->cfg->encoded, s->ech->cfg->encoded_len)
                 ) {
             SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
             return 0;
         }
-        OSSL_TRACE_BEGIN(TLS) { 
-            BIO_printf(trc_out,"sending 1st loaded ECHConfig (draft-13) back to client\n");
+        OSSL_TRACE_BEGIN(TLS) {
+          BIO_printf(trc_out,"sending 1st loaded ECHConfig (draft-13) back " \
+                             "to client\n");
         } OSSL_TRACE_END(TLS);
         return EXT_RETURN_SENT;
     }
