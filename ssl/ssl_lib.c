@@ -947,7 +947,7 @@ SSL *ossl_ssl_connection_new(SSL_CTX *ctx)
     s->ext.ech_sent_len=0;
     s->ext.ech_priv=NULL;
     s->ext.ech_pub=NULL;
-    s->ext.ech_pub_len=NULL;
+    s->ext.ech_pub_len=0;
 
 #endif
 
