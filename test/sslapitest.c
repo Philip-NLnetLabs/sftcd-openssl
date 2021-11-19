@@ -2034,7 +2034,6 @@ static int execute_test_session(int maxprot, int use_int_cache,
         OPENSSL_free(echkeyfile);
         OPENSSL_free(echconfiglist);
     }
-    EVP_PKEY_CTX_free(xctx);
 #endif
 
     /* Set up session cache */
@@ -10494,13 +10493,6 @@ int setup_tests(void)
 
     if (strcmp(modulename, "fips") == 0)
         is_fips = 1;
-
-#if 0
-#ifndef OPENSSL_NO_USABLE_ECH
-    if (!is_fips && hpke_setlibctx(libctx)!=1)
-        return 0;
-#endif
-#endif
 
     /*
      * We add, but don't load the test "tls-provider". We'll load it when we
