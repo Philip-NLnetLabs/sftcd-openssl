@@ -169,8 +169,8 @@ EVP_KDF_CTX *ossl_kdf_ctx_create(const char *kdfname, const char *mdname,
  * @file APIs and data structures for HPKE (RFC9180).
  */
 
-#ifndef OSSL_HPKE_H_INCLUDED
-# define OSSL_HPKE_H_INCLUDED
+#ifndef OSSL_HPKE_H
+# define OSSL_HPKE_H
 
 # include <openssl/ssl.h>
 
