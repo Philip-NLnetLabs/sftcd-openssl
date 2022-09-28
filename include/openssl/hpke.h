@@ -11,53 +11,16 @@
 # define OSSL_CRYPTO_HPKE_H
 # pragma once
 
-/* Constants from RFC 9180 Section 7.1 and 7.3 */
-#define OSSL_HPKE_MAX_SECRET 64
-#define OSSL_HPKE_MAX_PUBLIC 133
-#define OSSL_HPKE_MAX_PRIVATE 66
-#define OSSL_HPKE_MAX_NONCE 12
-#define OSSL_HPKE_MAX_KDF_INPUTLEN 64
+# ifdef __cplusplus
+extern "C" {
+# endif
 
-int ossl_hpke_kdf_extract(EVP_KDF_CTX *kctx,
-                          unsigned char *prk, size_t prklen,
-                          const unsigned char *salt, size_t saltlen,
-                          const unsigned char *ikm, size_t ikmlen);
-
-int ossl_hpke_kdf_expand(EVP_KDF_CTX *kctx,
-                         unsigned char *okm, size_t okmlen,
-                         const unsigned char *prk, size_t prklen,
-                         const unsigned char *info, size_t infolen);
-
-int ossl_hpke_labeled_extract(EVP_KDF_CTX *kctx,
-                              unsigned char *prk, size_t prklen,
-                              const unsigned char *salt, size_t saltlen,
-                              const unsigned char *suiteid, size_t suiteidlen,
-                              const char *label,
-                              const unsigned char *ikm, size_t ikmlen);
-int ossl_hpke_labeled_expand(EVP_KDF_CTX *kctx,
-                             unsigned char *okm, size_t okmlen,
-                             const unsigned char *prk, size_t prklen,
-                             const unsigned char *suiteid, size_t suiteidlen,
-                             const char *label,
-                             const unsigned char *info, size_t infolen);
-
-EVP_KDF_CTX *ossl_kdf_ctx_create(const char *kdfname, const char *mdname,
-                                 OSSL_LIB_CTX *libctx, const char *propq);
+# include <openssl/ssl.h>
 
 /**
  * @file
  * APIs and data structures for HPKE (RFC9180).
  */
-
-#ifndef OSSL_HPKE_H
-# define OSSL_HPKE_H
-# pragma once
-
-# include <openssl/ssl.h>
-
-# ifdef __cplusplus
-extern "C" {
-# endif
 
 /*
  * The HPKE modes
@@ -129,7 +92,7 @@ typedef struct {
     }
 
 # ifndef OSSL_HPKE_MAXSIZE
-#  define OSSL_HPKE_MAXSIZE 512
+#  define OSSL_HPKE_MAXSIZE 2048
 # endif
 
 /**
