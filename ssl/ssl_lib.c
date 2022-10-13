@@ -1425,7 +1425,8 @@ void ossl_ssl_connection_free(SSL *ssl)
     ssl_free_wbio_buffer(s);
 
 #ifndef OPENSSL_NO_ECH
-    if (s->ext.inner_s==NULL && s->ext.outer_s!=NULL)
+    if (s->server == 1 
+        || ( s->ext.inner_s==NULL && s->ext.outer_s!=NULL))
 #endif
     RECORD_LAYER_clear(&s->rlayer);
 
