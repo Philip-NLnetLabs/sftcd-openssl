@@ -88,7 +88,7 @@ typedef struct {
     }
 
 # ifndef OSSL_HPKE_MAXSIZE
-#  define OSSL_HPKE_MAXSIZE 2048
+#  define OSSL_HPKE_MAXSIZE 512
 # endif
 
 /**
