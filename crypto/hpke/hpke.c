@@ -1280,7 +1280,7 @@ int OSSL_HPKE_CTX_set_seq(OSSL_HPKE_CTX *ctx, uint64_t seq)
  */
 int OSSL_HPKE_encap(OSSL_HPKE_CTX *ctx,
                     unsigned char *enc, size_t *enclen,
-                    unsigned char *pub, size_t publen,
+                    const unsigned char *pub, size_t publen,
                     const unsigned char *info, size_t infolen)
 {
     int erv = 1;
@@ -1553,21 +1553,21 @@ int OSSL_HPKE_export(OSSL_HPKE_CTX *ctx,
 
 /*
  * @brief generate a key pair
- * @param libctx is the context to use
- * @param propq is a properties string
  * @param suite is the ciphersuite (currently unused)
  * @param ikmlen is the length of IKM, if supplied
  * @param ikm is IKM, if supplied
  * @param publen is the size of the public key buffer (exact length on output)
  * @param pub is the public value
  * @param priv is the private key handle
+ * @param libctx is the context to use
+ * @param propq is a properties string
  * @return 1 for good (OpenSSL style), not-1 for error
  */
-int OSSL_HPKE_keygen(OSSL_LIB_CTX *libctx, const char *propq,
-                     OSSL_HPKE_SUITE suite,
+int OSSL_HPKE_keygen(OSSL_HPKE_SUITE suite,
                      const unsigned char *ikm, size_t ikmlen,
                      unsigned char *pub, size_t *publen,
-                     EVP_PKEY **priv)
+                     EVP_PKEY **priv,
+                     OSSL_LIB_CTX *libctx, const char *propq)
 {
     return hpke_kg_evp(libctx, propq, suite,
                        ikmlen, ikm, publen, pub, priv);
