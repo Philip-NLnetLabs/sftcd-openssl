@@ -58,27 +58,25 @@ struct ossl_hpke_ctx_st
     int mode; /**< HPKE mode */
     OSSL_HPKE_SUITE suite; /**< suite */
     uint64_t seq; /**< sequence number */
-    unsigned char *shared_secret;
+    unsigned char *shared_secret; /* KEM output, zz */
     size_t shared_secretlen;
-    unsigned char *key;
+    unsigned char *key; /* final aead key */
     size_t keylen;
-    unsigned char *nonce;
+    unsigned char *nonce; /* aead base nonce */
     size_t noncelen;
     unsigned char *exportersec; /**< exporter secret */
     size_t exporterseclen;
     char *pskid; /**< PSK stuff */
     unsigned char *psk;
     size_t psklen;
-    unsigned char *info;
-    size_t infolen;
-    unsigned char *ikme;
-    size_t ikmelen;
     EVP_PKEY *authpriv; /**< sender's authentication private key */
     unsigned char *authpub; /**< auth public key */
     size_t authpublen;
+    unsigned char *ikme; /* IKM if using deterministic key gen */
+    size_t ikmelen;
 };
 
-/*
+/**
  * @brief check if KEM uses NIST curve or not
  * @param kem_id is the externally supplied kem_id
  * @return 1 for NIST, 0 for good-but-non-NIST, other otherwise
@@ -91,9 +89,8 @@ static int hpke_kem_id_nist_curve(uint16_t kem_id)
     return kem_info != NULL && kem_info->groupname != NULL;
 }
 
-/*
- * @brief hpke wrapper to import NIST curve public key as easily as x25519/x448
- *
+/**
+ * @brief wrapper to import NIST curve public key as easily as x25519/x448
  * @param libctx is the context to use
  * @param propq is a properties string
  * @param gname is the curve groupname
@@ -135,9 +132,8 @@ err:
     }
 }
 
-/*
+/**
  * @brief do the AEAD decryption
- *
  * @param libctx is the context to use
  * @param propq is a properties string
  * @param suite is the ciphersuite
@@ -256,9 +252,8 @@ err:
     return erv;
 }
 
-/*
+/**
  * @brief do AEAD encryption as per the RFC
- *
  * @param libctx is the context to use
  * @param propq is a properties string
  * @param suite is the ciphersuite
@@ -372,7 +367,7 @@ static int hpke_aead_enc(OSSL_LIB_CTX *libctx, const char *propq,
     }
     ciphertextlen += len;
     /*
-     * Get the tag This isn't a duplicate so needs to be added to the ciphertext
+     * Get tag. This isn't a duplicate so needs to be added to the ciphertext
      */
     if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_GET_TAG, taglen, tag) != 1) {
         erv = 0;
@@ -396,7 +391,7 @@ err:
     return erv;
 }
 
-/*
+/**
  * @brief check mode is in-range and supported
  * @param mode is the caller's chosen mode
  * @return 1 for good (OpenSSL style), not 1 for error
@@ -414,9 +409,9 @@ static int hpke_mode_check(unsigned int mode)
     }
     return 1;
 }
+
 /**
  * @brief check if a suite is supported locally
- *
  * @param suite is the suite to check
  * @return 1 for good/supported, 0 otherwise
  */
@@ -434,7 +429,6 @@ static int hpke_suite_check(OSSL_HPKE_SUITE suite)
 
 /*
  * @brief generate a key pair
- *
  * @param libctx is the context to use
  * @param propq is a properties string
  * @param mode is the mode (currently unused)
@@ -518,14 +512,10 @@ err:
 
 /*
  * @brief randomly pick a suite
- *
  * @param libctx is the context to use
  * @param propq is a properties string
  * @param suite is the result
  * @return 1 for success, otherwise failure
- *
- * If you change the structure of the various *_tab arrays
- * then this code will also need change.
  */
 static int hpke_random_suite(OSSL_LIB_CTX *libctx,
                              const char *propq,
@@ -679,6 +669,13 @@ static int hpke_expansion(OSSL_HPKE_SUITE suite,
     return 1;
 }
 
+/*
+ * @brief explode out a 64-bit unsigned into a buffer
+ * @param seq the input unsigned value
+ * @param buf is the buffer to explode that into
+ * @blen is the caller-allocated size of buf
+ * @return 0 for error, otherwise blen
+ */
 static size_t hpke_seq2buf(uint64_t seq, unsigned char *buf, size_t blen)
 {
     size_t i;
@@ -692,6 +689,15 @@ static size_t hpke_seq2buf(uint64_t seq, unsigned char *buf, size_t blen)
     return blen;
 }
 
+/*
+ * @brief call the underlying KEM to encap
+ * @param ctx is the OSSL_HPKE_CTX
+ * @param enc is a buffer for the sender's ephemeral public value
+ * @param enclen is the size of enc on input, number of octets used on ouptut
+ * @param pub is the recipient's public value
+ * @param publen is the length of pub
+ * @return 1 for success, 0 for error
+ */
 static int hpke_encap(OSSL_HPKE_CTX *ctx, unsigned char *enc, size_t *enclen,
                       const unsigned char *pub, size_t publen)
 {
@@ -788,6 +794,14 @@ err:
     return erv;
 }
 
+/*
+ * @brief call the underlying KEM to decap
+ * @param ctx is the OSSL_HPKE_CTX
+ * @param enc is a buffer for the sender's ephemeral public value
+ * @param enclen is the length of enc
+ * @param priv is the recipeient's private value
+ * @return 1 for success, 0 for error
+ */
 static int hpke_decap(OSSL_HPKE_CTX *ctx,
                       const unsigned char *enc, size_t enclen,
                       EVP_PKEY *priv)
@@ -874,8 +888,6 @@ static int hpke_decap(OSSL_HPKE_CTX *ctx,
     }
     EVP_PKEY_CTX_free(pctx);
     pctx = NULL;
-    /* free shared_secret in case this is 2nd call */
-    OPENSSL_clear_free(ctx->shared_secret, ctx->shared_secretlen);
     ctx->shared_secret = OPENSSL_malloc(lsslen);
     if (ctx->shared_secret == NULL) {
         erv = 0;
@@ -892,8 +904,18 @@ err:
     return erv;
 }
 
-static int hpke_do_rest(OSSL_HPKE_CTX *ctx,
-                        const unsigned char *info, size_t infolen)
+/*
+ * @brief do "middle" of HPKE, between KEM and AEAD
+ * @param ctx is the OSSL_HPKE_CTX
+ * @param info is a buffer for the added binding information
+ * @param infolen is the length of info
+ * @return 0 for error, 1 for success
+ *
+ * This does all the HPKE extrcts and expands and sets th ctx
+ * fields for the shared_secret, nonce, key and eporter_secret
+ */
+static int hpke_do_middle(OSSL_HPKE_CTX *ctx,
+                          const unsigned char *info, size_t infolen)
 {
     int erv = 1;
     size_t ks_contextlen = OSSL_HPKE_MAXSIZE;
@@ -910,7 +932,7 @@ static int hpke_do_rest(OSSL_HPKE_CTX *ctx,
     unsigned char suitebuf[6];
     const char *mdname = NULL;
 
-    /* just do this once */
+    /* only let this be done once */
     if (ctx->exportersec != NULL) {
         ERR_raise(ERR_LIB_CRYPTO, ERR_R_INTERNAL_ERROR);
         return 0;
@@ -1059,16 +1081,11 @@ err:
     return erv;
 }
 
-/* externally visible functions from below here */
-
-/**
- * @brief contex creator
- * @param mode is the desired HPKE mode
- * @param suite specifies the KEM, KDF and AEAD to use
- * @param libctx is the context to use
- * @param propq is a properties string
- * @return pointer to new context or NULL if error
+/*
+ * externally visible functions from below here, API documentation is
+ * in doc/man3/OSSL_HPKE_CTX_new.pod to avoid duplication
  */
+
 OSSL_HPKE_CTX *OSSL_HPKE_CTX_new(int mode, OSSL_HPKE_SUITE suite,
                                  OSSL_LIB_CTX *libctx, const char *propq)
 {
@@ -1077,8 +1094,6 @@ OSSL_HPKE_CTX *OSSL_HPKE_CTX_new(int mode, OSSL_HPKE_SUITE suite,
     if (hpke_mode_check(mode) != 1)
         return NULL;
     if (hpke_suite_check(suite) != 1)
-        return NULL;
-    if (mode < 0 || mode > OSSL_HPKE_MODE_PSKAUTH)
         return NULL;
     ctx = OPENSSL_zalloc(sizeof(OSSL_HPKE_CTX));
     if (ctx == NULL)
@@ -1098,10 +1113,6 @@ err:
     return NULL;
 }
 
-/**
- * @brief free up storage for a HPKE context
- * @param ctx is the pointer to be free'd (can be NULL)
- */
 void OSSL_HPKE_CTX_free(OSSL_HPKE_CTX *ctx)
 {
     if (ctx == NULL)
@@ -1115,21 +1126,12 @@ void OSSL_HPKE_CTX_free(OSSL_HPKE_CTX *ctx)
     OPENSSL_clear_free(ctx->shared_secret, ctx->shared_secretlen);
     OPENSSL_clear_free(ctx->ikme, ctx->ikmelen);
     EVP_PKEY_free(ctx->authpriv);
-    OPENSSL_free(ctx->info);
     OPENSSL_free(ctx->authpub);
 
     OPENSSL_free(ctx);
     return;
 }
 
-/**
- * @brief set a PSK for an HPKE context
- * @param ctx is the pointer for the HPKE context
- * @param pskid is a string identifying the PSK
- * @param psk is the PSK buffer
- * @param psklen is the size of the PSK
- * @return 1 for success, 0 for error
- */
 int OSSL_HPKE_CTX_set1_psk(OSSL_HPKE_CTX *ctx,
                            const char *pskid,
                            const unsigned char *psk, size_t psklen)
@@ -1163,13 +1165,6 @@ err:
     return 0;
 }
 
-/**
- * @brief set a sender IKM for key DHKEM generation
- * @param ctx is the pointer for the HPKE context
- * @param ikme is a buffer for the IKM
- * @param ikmelen is the length of the above
- * @return 1 for success, 0 for error
- */
 int OSSL_HPKE_CTX_set1_ikme(OSSL_HPKE_CTX *ctx,
                             const unsigned char *ikme, size_t ikmelen)
 {
@@ -1186,12 +1181,6 @@ int OSSL_HPKE_CTX_set1_ikme(OSSL_HPKE_CTX *ctx,
     return 1;
 }
 
-/**
- * @brief set a private key for HPKE authenticated modes
- * @param ctx is the pointer for the HPKE context
- * @param privp is an EVP_PKEY form of the private key
- * @return 1 for success, 0 for error
- */
 int OSSL_HPKE_CTX_set1_authpriv(OSSL_HPKE_CTX *ctx, EVP_PKEY *priv)
 {
     if (ctx == NULL || priv == NULL) {
@@ -1211,13 +1200,6 @@ int OSSL_HPKE_CTX_set1_authpriv(OSSL_HPKE_CTX *ctx, EVP_PKEY *priv)
     return 1;
 }
 
-/**
- * @brief set a public key for HPKE authenticated modes
- * @param ctx is the pointer for the HPKE context
- * @param pub is an buffer form of the public key
- * @param publen is the length of the above
- * @return 1 for success, 0 for error
- */
 int OSSL_HPKE_CTX_set1_authpub(OSSL_HPKE_CTX *ctx,
                                const unsigned char *pub, size_t publen)
 {
@@ -1233,15 +1215,6 @@ int OSSL_HPKE_CTX_set1_authpub(OSSL_HPKE_CTX *ctx,
     return 1;
 }
 
-/**
- * @brief ask for the state of the sequence of seal/open calls
- * @param ctx is the pointer for the HPKE context
- * @param seq returns the positive integer sequence number
- * @return 1 for success, 0 for error
- *
- * The value returned is the most recent used when sealing
- * or opening (successfully)
- */
 int OSSL_HPKE_CTX_get_seq(OSSL_HPKE_CTX *ctx, uint64_t *seq)
 {
     if (ctx == NULL || seq == NULL)
@@ -1250,15 +1223,6 @@ int OSSL_HPKE_CTX_get_seq(OSSL_HPKE_CTX *ctx, uint64_t *seq)
     return 1;
 }
 
-/**
- * @brief set the sequence value for seal/open calls
- * @param ctx is the pointer for the HPKE context
- * @param seq set the positive integer sequence number
- * @return 1 for success, 0 for error
- *
- * The value returned is the most recent used when sealing
- * or opening (successfully)
- */
 int OSSL_HPKE_CTX_set_seq(OSSL_HPKE_CTX *ctx, uint64_t seq)
 {
     if (ctx == NULL)
@@ -1267,17 +1231,6 @@ int OSSL_HPKE_CTX_set_seq(OSSL_HPKE_CTX *ctx, uint64_t seq)
     return 1;
 }
 
-/**
- * @brief sender encapsulation function
- * @param ctx is the pointer for the HPKE context
- * @param enc is the sender's ephemeral public value
- * @param enclen is the size the above
- * @param pub is the recipient public key octets
- * @param publen is the size the above
- * @param info is the info parameter
- * @param infolen is the size the above
- * @return 1 for success, 0 for error
- */
 int OSSL_HPKE_encap(OSSL_HPKE_CTX *ctx,
                     unsigned char *enc, size_t *enclen,
                     const unsigned char *pub, size_t publen,
@@ -1290,7 +1243,7 @@ int OSSL_HPKE_encap(OSSL_HPKE_CTX *ctx,
         ERR_raise(ERR_LIB_CRYPTO, ERR_R_PASSED_NULL_PARAMETER);
         return 0;
     }
-    if (ctx->shared_secret != NULL || ctx->info != NULL) {
+    if (ctx->shared_secret != NULL) {
         /* only allow one encap per OSSL_HPKE_CTX */
         ERR_raise(ERR_LIB_CRYPTO, ERR_R_SHOULD_NOT_HAVE_BEEN_CALLED);
         return 0;
@@ -1299,20 +1252,15 @@ int OSSL_HPKE_encap(OSSL_HPKE_CTX *ctx,
         ERR_raise(ERR_LIB_CRYPTO, ERR_R_INTERNAL_ERROR);
         return 0;
     }
-    erv = hpke_do_rest(ctx, info, infolen);
+    /*
+     * note that the info is not part of the context as it
+     * only needs to be used once here so doesn't need to
+     * be stored
+     */
+    erv = hpke_do_middle(ctx, info, infolen);
     return erv;
 }
 
-/**
- * @brief recipient decapsulation function
- * @param ctx is the pointer for the HPKE context
- * @param enc is the sender's ephemeral public value
- * @param enclen is the size the above
- * @param recippriv is the EVP_PKEY form of recipient private value
- * @param info is the info parameter
- * @param infolen is the size the above
- * @return 1 for success, 0 for error
- */
 int OSSL_HPKE_decap(OSSL_HPKE_CTX *ctx,
                     const unsigned char *enc, size_t enclen,
                     EVP_PKEY *recippriv,
@@ -1334,21 +1282,15 @@ int OSSL_HPKE_decap(OSSL_HPKE_CTX *ctx,
         ERR_raise(ERR_LIB_CRYPTO, ERR_R_INTERNAL_ERROR);
         return 0;
     }
-    erv = hpke_do_rest(ctx, info, infolen);
+    /*
+     * note that the info is not part of the context as it
+     * only needs to be used once here so doesn't need to
+     * be stored
+     */
+    erv = hpke_do_middle(ctx, info, infolen);
     return erv;
 }
 
-/**
- * @brief new sender seal function
- * @param ctx is the pointer for the HPKE context
- * @param ct is the ciphertext output
- * @param ctlen is the size the above
- * @param aad is the aad parameter
- * @param aadlen is the size the above
- * @param pt is the plaintext
- * @param ptlen is the size the above
- * @return 1 for success, 0 for error
- */
 int OSSL_HPKE_seal(OSSL_HPKE_CTX *ctx,
                    unsigned char *ct, size_t *ctlen,
                    const unsigned char *aad, size_t aadlen,
@@ -1415,17 +1357,6 @@ err:
     return 1;
 }
 
-/**
- * @brief new sender seal function
- * @param ctx is the pointer for the HPKE context
- * @param ct is the ciphertext output
- * @param ctlen is the size the above
- * @param aad is the aad parameter
- * @param aadlen is the size the above
- * @param pt is the plaintext
- * @param ptlen is the size the above
- * @return 1 for success, 0 for error
- */
 int OSSL_HPKE_open(OSSL_HPKE_CTX *ctx,
                    unsigned char *pt, size_t *ptlen,
                    const unsigned char *aad, size_t aadlen,
@@ -1491,15 +1422,6 @@ err:
     return 1;
 }
 
-/**
- * @brief generate a given-length secret based on context and label
- * @param ctx is the HPKE context
- * @param secret is the resulting secret that will be of length...
- * @param secretlen is the desired output length
- * @param label is a buffer to provide separation between secrets
- * @param labellen is the length of the above
- * @return 1 for good, 0 for error
- */
 int OSSL_HPKE_export(OSSL_HPKE_CTX *ctx,
                      unsigned char *secret, size_t secretlen,
                      const unsigned char *label, size_t labellen)
@@ -1551,18 +1473,6 @@ int OSSL_HPKE_export(OSSL_HPKE_CTX *ctx,
     return 1;
 }
 
-/*
- * @brief generate a key pair
- * @param suite is the ciphersuite (currently unused)
- * @param ikmlen is the length of IKM, if supplied
- * @param ikm is IKM, if supplied
- * @param publen is the size of the public key buffer (exact length on output)
- * @param pub is the public value
- * @param priv is the private key handle
- * @param libctx is the context to use
- * @param propq is a properties string
- * @return 1 for good (OpenSSL style), not-1 for error
- */
 int OSSL_HPKE_keygen(OSSL_HPKE_SUITE suite,
                      const unsigned char *ikm, size_t ikmlen,
                      unsigned char *pub, size_t *publen,
@@ -1573,32 +1483,11 @@ int OSSL_HPKE_keygen(OSSL_HPKE_SUITE suite,
                        ikmlen, ikm, publen, pub, priv);
 }
 
-/**
- * @brief check if a suite is supported locally
- *
- * @param suite is the suite to check
- * @return 1 for good/supported, not-1 otherwise
- */
 int OSSL_HPKE_suite_check(OSSL_HPKE_SUITE suite)
 {
     return hpke_suite_check(suite);
 }
 
-/*
- * @brief get a (possibly) random suite, public key and ciphertext for GREASErs
- *
- * As usual buffers are caller allocated and lengths on input are buffer size.
- *
- * @param libctx is the context to use
- * @param propq is a properties string
- * @param suite_in specifies the preferred suite or NULL for a random choice
- * @param suite is the chosen or random suite
- * @param pub a random value of the appropriate length for a sender public value
- * @param pub_len is the length of pub (buffer size on input)
- * @param cipher is a random value of the appropriate length for a ciphertext
- * @param cipher_len is the length of cipher
- * @return 1 for success, otherwise failure
- */
 int OSSL_HPKE_get_grease_value(OSSL_LIB_CTX *libctx, const char *propq,
                                OSSL_HPKE_SUITE *suite_in,
                                OSSL_HPKE_SUITE *suite,
@@ -1611,30 +1500,11 @@ int OSSL_HPKE_get_grease_value(OSSL_LIB_CTX *libctx, const char *propq,
                                  enc, enclen, ct, ctlen);
 }
 
-/*
- * @brief map a string to a HPKE suite
- * @param str is the string value
- * @param suite is the resulting suite
- * @return 1 for success, otherwise failure
- */
 int OSSL_HPKE_str2suite(const char *str, OSSL_HPKE_SUITE *suite)
 {
     return ossl_hpke_str2suite(str, suite);
 }
 
-/*
- * @brief tell the caller how big the ciphertext will be
- * @param suite is the suite to be used
- * @param clearlen is the length of plaintext
- * @return the length of the related ciphertext or zero on error
- *
- * AEAD algorithms add a tag for data authentication.
- * Those are almost always, but not always, 16 octets
- * long, and who know what'll be true in the future.
- * So this function allows a caller to find out how
- * much data expansion they'll see with a given
- * suite.
- */
 size_t OSSL_HPKE_get_ciphertext_size(OSSL_HPKE_SUITE suite, size_t clearlen)
 {
     size_t enclen = 0;
@@ -1645,18 +1515,6 @@ size_t OSSL_HPKE_get_ciphertext_size(OSSL_HPKE_SUITE suite, size_t clearlen)
     return cipherlen;
 }
 
-/*
- * @brief tell the caller how big the public value ``enc`` will be
- * @param suite is the suite to be used
- * @return size of public encap or zero on error
- *
- * AEAD algorithms add a tag for data authentication.
- * Those are almost always, but not always, 16 octets
- * long, and who know what'll be true in the future.
- * So this function allows a caller to find out how
- * much data expansion they'll see with a given
- * suite.
- */
 size_t OSSL_HPKE_get_public_encap_size(OSSL_HPKE_SUITE suite)
 {
     size_t enclen = 0;
@@ -1668,16 +1526,6 @@ size_t OSSL_HPKE_get_public_encap_size(OSSL_HPKE_SUITE suite)
     return enclen;
 }
 
-/**
- * @brief recommend an IKM size in octets for a given suite
- * @param suite is the suite to be used
- * @return the recommended size or zero on error
- *
- * Today, this really only uses the KEM to recommend
- * the number of random octets to use based on the
- * size of a private value. In future, it could also
- * factor in e.g. the AEAD.
- */
 size_t OSSL_HPKE_get_recommended_ikmelen(OSSL_HPKE_SUITE suite)
 {
     const OSSL_HPKE_KEM_INFO *kem_info = NULL;
