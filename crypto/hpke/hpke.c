@@ -7,27 +7,18 @@
  * https://www.openssl.org/source/license.html
  */
 
-/**
- * @file
- * An OpenSSL-based HPKE implementation of RFC9180
- */
+/* An OpenSSL-based HPKE implementation of RFC9180 */
 
-#include <stddef.h>
-#include <stdint.h>
 #include <string.h>
-
-#include <openssl/ssl.h>
 #include <openssl/rand.h>
 #include <openssl/kdf.h>
-#include <openssl/evp.h>
-#include <openssl/params.h>
-#include <openssl/param_build.h>
 #include <openssl/core_names.h>
-#include <internal/packet.h>
-#include <internal/common.h>
 #include <openssl/hpke.h>
-#include <internal/hpke_util.h>
+#include <openssl/sha.h>
+#include <openssl/evp.h>
 #include <openssl/err.h>
+#include "internal/hpke_util.h"
+#include "internal/nelem.h"
 
 /** default buffer size for keys and internal buffers we use */
 #ifndef OSSL_HPKE_MAXSIZE
@@ -35,7 +26,7 @@
 #endif
 
 /* Define HPKE labels from RFC 9180 in hex for EBCDIC compatibility */
-/**< "HPKE" - "suite_id" label for 5.1 */
+/**< "HPKE" - "suite_id" label for section 5.1 */
 static const char OSSL_HPKE_SEC51LABEL[] = "\x48\x50\x4b\x45";
 /**< "psk_id_hash" - in key_schedule_context */
 static const char OSSL_HPKE_PSKIDHASH_LABEL[] = "\x70\x73\x6b\x5f\x69\x64\x5f\x68\x61\x73\x68";
@@ -54,157 +45,8 @@ static const char OSSL_HPKE_PSK_HASH_LABEL[] = "\x70\x73\x6b\x5f\x68\x61\x73\x68
 /**<  "secret" - for generating shared secret */
 static const char OSSL_HPKE_SECRET_LABEL[] = "\x73\x65\x63\x72\x65\x74";
 
-/* max string len we'll try map to a suite */
-#define OSSL_HPKE_MAX_SUITESTR 38
-
 /* "strength" input to RAND_bytes_ex */
 #define OSSL_HPKE_RSTRENGTH 10
-
-/*
- * structs and arrays of those below with information about the
- * various parts of an OSSL_HPKE_SUITE. Mainly, these are to map
- * from the IANA codepoints and lengths defined in RFC9180 to
- * library-internal identifiers for those same algorithms. (These
- * are needed as RFC9180 defines new HPKE-specfic codepoints for
- * the various things needed.
- *
- * Note that if additions are made to the set of IANA codepoints
- * and the tables immediately below, corresponding additions should
- * also be made to the synonymtab tables a little further down so
- * that OSSL_HPKE_str2suite() continues to function.
- */
-/*
- * @brief info about an AEAD
- */
-typedef struct {
-    uint16_t            aead_id; /**< code point for aead alg */
-    const char *        name;   /* alg name */
-    size_t              taglen; /**< aead tag len */
-    size_t              Nk; /**< size of a key for this aead */
-    size_t              Nn; /**< length of a nonce for this aead */
-} hpke_aead_info_t;
-
-/*
- * @brief table of AEADs
- */
-static hpke_aead_info_t hpke_aead_tab[] = {
-    { 0, NULL, 0, 0, 0 }, /* treat 0 as error so nothing here */
-    { OSSL_HPKE_AEAD_ID_AES_GCM_128, LN_aes_128_gcm, 16, 16, 12 },
-    { OSSL_HPKE_AEAD_ID_AES_GCM_256, LN_aes_256_gcm, 16, 32, 12 },
-#ifndef OPENSSL_NO_CHACHA20
-# ifndef OPENSSL_NO_POLY1305
-    { OSSL_HPKE_AEAD_ID_CHACHA_POLY1305, LN_chacha20_poly1305, 16, 32, 12 },
-# endif
-    { OSSL_HPKE_AEAD_ID_EXPORTONLY, NULL, 0, 0, 0 }
-#endif
-};
-
-/*
- * @brief info about a KEM
- */
-typedef struct {
-    uint16_t       kem_id; /**< code point for key encipherment method */
-    const char     *keytype; /**< string form of algtype "EC"/"X25519"/"X448" */
-    const char     *groupname; /**< string form of EC group for NIST curves  */
-    int            groupid; /**< NID of KEM */
-    const char     *mdname; /**< hash alg name for the HKDF */
-    size_t         Nsecret; /**< size of secrets */
-    size_t         Nenc; /**< length of encapsulated key */
-    size_t         Npk; /**< length of public key */
-    size_t         Npriv; /**< length of raw private key */
-} hpke_kem_info_t;
-
-/*
- * @brief table of KEMs
- */
-static hpke_kem_info_t hpke_kem_tab[] = {
-    { 0, NULL, NULL, 0, NULL, 0, 0, 0 }, /* treat 0 as error so nowt here */
-    { OSSL_HPKE_KEM_ID_P256, "EC", OSSL_HPKE_KEMSTR_P256, NID_X9_62_prime256v1,
-      LN_sha256, 32, 65, 65, 32 },
-    { OSSL_HPKE_KEM_ID_P384, "EC", OSSL_HPKE_KEMSTR_P384, NID_secp384r1,
-      LN_sha384, 48, 97, 97, 48 },
-    { OSSL_HPKE_KEM_ID_P521, "EC", OSSL_HPKE_KEMSTR_P521, NID_secp521r1,
-      LN_sha512, 64, 133, 133, 66 },
-    { OSSL_HPKE_KEM_ID_X25519, OSSL_HPKE_KEMSTR_X25519, NULL, NID_X25519,
-      LN_sha256, 32, 32, 32, 32 },
-    { OSSL_HPKE_KEM_ID_X448, OSSL_HPKE_KEMSTR_X448, NULL, NID_X448,
-      LN_sha512, 64, 56, 56, 56 }
-};
-
-/*
- * @brief info about a KDF
- */
-typedef struct {
-    uint16_t       kdf_id; /**< code point for KDF */
-    const char     *mdname; /**< hash alg name for the HKDF */
-    size_t         Nh; /**< length of hash/extract output */
-} hpke_kdf_info_t;
-
-/*
- * @brief table of KDFs
- */
-static hpke_kdf_info_t hpke_kdf_tab[] = {
-    { 0, NULL, 0 }, /* keep indexing correct */
-    { OSSL_HPKE_KDF_ID_HKDF_SHA256, LN_sha256, SHA256_DIGEST_LENGTH },
-    { OSSL_HPKE_KDF_ID_HKDF_SHA384, LN_sha384, SHA384_DIGEST_LENGTH },
-    { OSSL_HPKE_KDF_ID_HKDF_SHA512, LN_sha512, SHA512_DIGEST_LENGTH }
-};
-
-/**
- * table with identifier and synonym strings
- * right now, there are 4 synonyms for each - a name, a hex string
- * a hex string with a leading zero and a decimal string - more
- * could be added but that seems like enough
- */
-typedef struct OSSL_HPKE_synonymtab_str {
-    uint16_t id;
-    char *synonyms[4];
-} synonymttab_t;
-
-/**
- * synonym table for KEMs
- */
-static synonymttab_t kemstrtab[] = {
-    {OSSL_HPKE_KEM_ID_P256,
-     {OSSL_HPKE_KEMSTR_P256, "0x10", "0x10", "16" }},
-    {OSSL_HPKE_KEM_ID_P384,
-     {OSSL_HPKE_KEMSTR_P384, "0x11", "0x11", "17" }},
-    {OSSL_HPKE_KEM_ID_P521,
-     {OSSL_HPKE_KEMSTR_P521, "0x12", "0x12", "18" }},
-    {OSSL_HPKE_KEM_ID_X25519,
-     {OSSL_HPKE_KEMSTR_X25519, "0x20", "0x20", "32" }},
-    {OSSL_HPKE_KEM_ID_X448,
-     {OSSL_HPKE_KEMSTR_X448, "0x21", "0x21", "33" }}
-};
-
-/**
- * synonym table for KDFs
- */
-static synonymttab_t kdfstrtab[] = {
-    {OSSL_HPKE_KDF_ID_HKDF_SHA256,
-     {OSSL_HPKE_KDFSTR_256, "0x1", "0x01", "1"}},
-    {OSSL_HPKE_KDF_ID_HKDF_SHA384,
-     {OSSL_HPKE_KDFSTR_384, "0x2", "0x02", "2"}},
-    {OSSL_HPKE_KDF_ID_HKDF_SHA512,
-     {OSSL_HPKE_KDFSTR_512, "0x3", "0x03", "3"}}
-};
-
-/**
- * synonym table for AEADs
- */
-static synonymttab_t aeadstrtab[] = {
-    {OSSL_HPKE_AEAD_ID_AES_GCM_128,
-     {OSSL_HPKE_AEADSTR_AES128GCM, "0x1", "0x01", "1"}},
-    {OSSL_HPKE_AEAD_ID_AES_GCM_256,
-     {OSSL_HPKE_AEADSTR_AES256GCM, "0x2", "0x02", "2"}},
-    {OSSL_HPKE_AEAD_ID_CHACHA_POLY1305,
-     {OSSL_HPKE_AEADSTR_CP, "0x3", "0x03", "3"}}
-};
-
-/* "operations" for input to hpke_do_rest func */
-#define OSSL_HPKE_OP_ENC 1
-#define OSSL_HPKE_OP_DEC 2
-#define OSSL_HPKE_OP_EXPONLY 3
 
 /**
  * @brief sender or receiver context
@@ -216,119 +58,63 @@ struct ossl_hpke_ctx_st
     int mode; /**< HPKE mode */
     OSSL_HPKE_SUITE suite; /**< suite */
     uint64_t seq; /**< sequence number */
-    unsigned char *shared_secret;
+    unsigned char *shared_secret; /* KEM output, zz */
     size_t shared_secretlen;
+    unsigned char *key; /* final aead key */
+    size_t keylen;
+    unsigned char *nonce; /* aead base nonce */
+    size_t noncelen;
     unsigned char *exportersec; /**< exporter secret */
     size_t exporterseclen;
     char *pskid; /**< PSK stuff */
     unsigned char *psk;
     size_t psklen;
-    unsigned char *info;
-    size_t infolen;
-    unsigned char *ikme;
-    size_t ikmelen;
     EVP_PKEY *authpriv; /**< sender's authentication private key */
     unsigned char *authpub; /**< auth public key */
     size_t authpublen;
+    unsigned char *ikme; /* IKM if using deterministic key gen */
+    size_t ikmelen;
 };
 
-/*
- * @brief map from IANA codepoint to AEAD table index
- *
- * @param codepoint should be an IANA code point
- * @return index in AEAD table or 0 if error
- */
-static uint16_t aead_iana2index(uint16_t codepoint)
-{
-    uint16_t naeads = OSSL_NELEM(hpke_aead_tab);
-    uint16_t i = 0;
-
-    for (i = 0; i != naeads; i++) {
-        if (hpke_aead_tab[i].aead_id == codepoint)
-            return i;
-    }
-    return 0;
-}
-
-/*
- * @brief map from IANA codepoint to KEM table index
- *
- * @param codepoint should be an IANA code point
- * @return index in KEM table or 0 if error
- */
-static uint16_t kem_iana2index(uint16_t codepoint)
-{
-    uint16_t nkems = OSSL_NELEM(hpke_kem_tab);
-    uint16_t i = 0;
-
-    for (i = 0; i != nkems; i++) {
-        if (hpke_kem_tab[i].kem_id == codepoint)
-            return i;
-    }
-    return 0;
-}
-
-/*
- * @brief map from IANA codepoint to KDF table index
- *
- * @param codepoint should be an IANA code point
- * @return index in KDF table or 0 if error
- */
-static uint16_t kdf_iana2index(uint16_t codepoint)
-{
-    uint16_t nkdfs = OSSL_NELEM(hpke_kdf_tab);
-    uint16_t i = 0;
-
-    for (i = 0; i != nkdfs; i++) {
-        if (hpke_kdf_tab[i].kdf_id == codepoint)
-            return i;
-    }
-    return 0;
-}
-
-/*
+/**
  * @brief check if KEM uses NIST curve or not
  * @param kem_id is the externally supplied kem_id
  * @return 1 for NIST, 0 for good-but-non-NIST, other otherwise
  */
 static int hpke_kem_id_nist_curve(uint16_t kem_id)
 {
-    switch (kem_id) {
-    case OSSL_HPKE_KEM_ID_P256:
-    case OSSL_HPKE_KEM_ID_P384:
-    case OSSL_HPKE_KEM_ID_P521:
-        return 1;
-    default:
-        return 0;
-    }
-    return 0;
+    const OSSL_HPKE_KEM_INFO *kem_info = NULL;
+
+    kem_info = ossl_HPKE_KEM_INFO_find_id(kem_id);
+    return kem_info != NULL && kem_info->groupname != NULL;
 }
 
-/*
- * @brief hpke wrapper to import NIST curve public key as easily as x25519/x448
- *
+/**
+ * @brief wrapper to import NIST curve public key as easily as x25519/x448
  * @param libctx is the context to use
  * @param propq is a properties string
- * @param curve is the curve NID
  * @param gname is the curve groupname
  * @param buf is the binary buffer with the (uncompressed) public value
  * @param buflen is the length of the private key buffer
  * @return a working EVP_PKEY * or NULL
  */
-static EVP_PKEY * EVP_PKEY_new_raw_nist_public_key(OSSL_LIB_CTX *libctx,
-                                                   const char *propq,
-                                                   int curve,
-                                                   const char *gname,
-                                                   const unsigned char *buf,
-                                                   size_t buflen)
+static EVP_PKEY *EVP_PKEY_new_raw_nist_public_key(OSSL_LIB_CTX *libctx,
+                                                  const char *propq,
+                                                  const char *gname,
+                                                  const unsigned char *buf,
+                                                  size_t buflen)
 {
     int erv = 0;
+    OSSL_PARAM params[2];
     EVP_PKEY *ret = NULL;
     EVP_PKEY_CTX *cctx = EVP_PKEY_CTX_new_from_name(libctx, "EC", propq);
 
+    params[0] = OSSL_PARAM_construct_utf8_string(OSSL_PKEY_PARAM_GROUP_NAME,
+                                                 (char *)gname, 0);
+    params[1] = OSSL_PARAM_construct_end();
     if (cctx == NULL
         || EVP_PKEY_paramgen_init(cctx) <= 0
-        || EVP_PKEY_CTX_set_ec_paramgen_curve_nid(cctx, curve) <= 0
+        || EVP_PKEY_CTX_set_params(cctx, params) <= 0
         || EVP_PKEY_paramgen(cctx, &ret) <= 0
         || EVP_PKEY_set1_encoded_public_key(ret, buf, buflen) != 1) {
         goto err;
@@ -346,9 +132,8 @@ err:
     }
 }
 
-/*
+/**
  * @brief do the AEAD decryption
- *
  * @param libctx is the context to use
  * @param propq is a properties string
  * @param suite is the ciphersuite
@@ -378,16 +163,16 @@ static int hpke_aead_dec(OSSL_LIB_CTX *libctx, const char *propq,
     size_t plaintextlen = 0;
     unsigned char *plaintext = NULL;
     size_t taglen;
-    uint16_t aead_ind = 0;
     EVP_CIPHER *enc = NULL;
+    const OSSL_HPKE_AEAD_INFO *aead_info = NULL;
 
-    aead_ind = aead_iana2index(suite.aead_id);
-    if (aead_ind == 0) {
+    aead_info = ossl_HPKE_AEAD_INFO_find_id(suite.aead_id);
+    if (aead_info == NULL) {
         erv = 0;
         ERR_raise(ERR_LIB_CRYPTO, ERR_R_INTERNAL_ERROR);
         goto err;
     }
-    taglen = hpke_aead_tab[aead_ind].taglen;
+    taglen = aead_info->taglen;
     plaintext = OPENSSL_malloc(cipherlen);
     if (plaintext == NULL) {
         erv = 0;
@@ -401,7 +186,7 @@ static int hpke_aead_dec(OSSL_LIB_CTX *libctx, const char *propq,
         goto err;
     }
     /* Initialise the encryption operation */
-    enc = EVP_CIPHER_fetch(libctx, hpke_aead_tab[aead_ind].name, propq);
+    enc = EVP_CIPHER_fetch(libctx, aead_info->name, propq);
     if (enc == NULL) {
         erv = 0;
         ERR_raise(ERR_LIB_CRYPTO, ERR_R_INTERNAL_ERROR);
@@ -467,9 +252,8 @@ err:
     return erv;
 }
 
-/*
+/**
  * @brief do AEAD encryption as per the RFC
- *
  * @param libctx is the context to use
  * @param propq is a properties string
  * @param suite is the ciphersuite
@@ -499,17 +283,17 @@ static int hpke_aead_enc(OSSL_LIB_CTX *libctx, const char *propq,
     size_t ciphertextlen;
     unsigned char *ciphertext = NULL;
     size_t taglen = 0;
-    uint16_t aead_ind = 0;
+    const OSSL_HPKE_AEAD_INFO *aead_info = NULL;
     EVP_CIPHER *enc = NULL;
     unsigned char tag[16];
 
-    aead_ind = aead_iana2index(suite.aead_id);
-    if (aead_ind == 0) {
+    aead_info = ossl_HPKE_AEAD_INFO_find_id(suite.aead_id);
+    if (aead_info == NULL) {
         erv = 0;
         ERR_raise(ERR_LIB_CRYPTO, ERR_R_INTERNAL_ERROR);
         goto err;
     }
-    taglen = hpke_aead_tab[aead_ind].taglen;
+    taglen = aead_info->taglen;
     if (taglen != 16) {
         erv = 0;
         ERR_raise(ERR_LIB_CRYPTO, ERR_R_INTERNAL_ERROR);
@@ -537,7 +321,7 @@ static int hpke_aead_enc(OSSL_LIB_CTX *libctx, const char *propq,
         goto err;
     }
     /* Initialise the encryption operation. */
-    enc = EVP_CIPHER_fetch(libctx, hpke_aead_tab[aead_ind].name, propq);
+    enc = EVP_CIPHER_fetch(libctx, aead_info->name, propq);
     if (enc == NULL) {
         erv = 0;
         ERR_raise(ERR_LIB_CRYPTO, ERR_R_INTERNAL_ERROR);
@@ -569,10 +353,6 @@ static int hpke_aead_enc(OSSL_LIB_CTX *libctx, const char *propq,
             goto err;
         }
     }
-    /*
-     * Provide the message to be encrypted, and obtain the encrypted output.
-     * EVP_EncryptUpdate can be called multiple times if necessary
-     */
     if (EVP_EncryptUpdate(ctx, ciphertext, &len, plain, plainlen) != 1) {
         erv = 0;
         ERR_raise(ERR_LIB_CRYPTO, ERR_R_INTERNAL_ERROR);
@@ -587,7 +367,7 @@ static int hpke_aead_enc(OSSL_LIB_CTX *libctx, const char *propq,
     }
     ciphertextlen += len;
     /*
-     * Get the tag This isn't a duplicate so needs to be added to the ciphertext
+     * Get tag. This isn't a duplicate so needs to be added to the ciphertext
      */
     if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_GET_TAG, taglen, tag) != 1) {
         erv = 0;
@@ -611,7 +391,7 @@ err:
     return erv;
 }
 
-/*
+/**
  * @brief check mode is in-range and supported
  * @param mode is the caller's chosen mode
  * @return 1 for good (OpenSSL style), not 1 for error
@@ -629,70 +409,39 @@ static int hpke_mode_check(unsigned int mode)
     }
     return 1;
 }
+
 /**
  * @brief check if a suite is supported locally
- *
  * @param suite is the suite to check
- * @return 1 for good/supported, not 1 otherwise
+ * @return 1 for good/supported, 0 otherwise
  */
 static int hpke_suite_check(OSSL_HPKE_SUITE suite)
 {
-    /*
-     * Check that the fields of the suite are each
-     * implemented here, loops below start at one
-     * as zero'th element of tables is "null"
-     */
-    int kem_ok = 0;
-    int kdf_ok = 0;
-    int aead_ok = 0;
-    int ind = 0;
-    int nkems = OSSL_NELEM(hpke_kem_tab);
-    int nkdfs = OSSL_NELEM(hpke_kdf_tab);
-    int naeads = OSSL_NELEM(hpke_aead_tab);
-
-    /* check KEM */
-    for (ind = 1; ind != nkems; ind++) {
-        if (suite.kem_id == hpke_kem_tab[ind].kem_id) {
-            kem_ok = 1;
-            break;
-        }
-    }
-
-    /* check kdf */
-    for (ind = 1; ind != nkdfs; ind++) {
-        if (suite.kdf_id == hpke_kdf_tab[ind].kdf_id) {
-            kdf_ok = 1;
-            break;
-        }
-    }
-
-    /* check aead */
-    for (ind = 1; ind != naeads; ind++) {
-        if (suite.aead_id == hpke_aead_tab[ind].aead_id) {
-            aead_ok = 1;
-            break;
-        }
-    }
-
-    if (kem_ok == 1 && kdf_ok == 1 && aead_ok == 1)
-        return 1;
-    return 0;
+    /* check KEM, KDF and AEAD are supported here */
+    if (ossl_HPKE_KEM_INFO_find_id(suite.kem_id) == NULL)
+        return 0;
+    if (ossl_HPKE_KDF_INFO_find_id(suite.kdf_id) == NULL)
+        return 0;
+    if (ossl_HPKE_AEAD_INFO_find_id(suite.aead_id) == NULL)
+        return 0;
+    return 1;
 }
 
 /*
- * @brief generate a key pair keeping private inside API
- *
+ * @brief generate a key pair
  * @param libctx is the context to use
  * @param propq is a properties string
  * @param mode is the mode (currently unused)
  * @param suite is the ciphersuite
+ * @param ikmlen is the length of IKM, if supplied
+ * @param ikm is IKM, if supplied
  * @param publen is the size of the public key buffer (exact length on output)
  * @param pub is the public value
  * @param priv is the private key pointer
  * @return 1 for good (OpenSSL style), not 1 for error
  */
 static int hpke_kg_evp(OSSL_LIB_CTX *libctx, const char *propq,
-                       unsigned int mode, OSSL_HPKE_SUITE suite,
+                       OSSL_HPKE_SUITE suite,
                        size_t ikmlen, const unsigned char *ikm,
                        size_t *publen, unsigned char *pub,
                        EVP_PKEY **priv)
@@ -700,7 +449,7 @@ static int hpke_kg_evp(OSSL_LIB_CTX *libctx, const char *propq,
     int erv = 1; /* Our error return value - 1 is success */
     EVP_PKEY_CTX *pctx = NULL;
     EVP_PKEY *skR = NULL;
-    uint16_t kem_ind = 0;
+    const OSSL_HPKE_KEM_INFO *kem_info = NULL;
     OSSL_PARAM params[3], *p = params;
 
     if (hpke_suite_check(suite) != 1)
@@ -711,8 +460,8 @@ static int hpke_kg_evp(OSSL_LIB_CTX *libctx, const char *propq,
         return 0;
     if (ikmlen == 0 && ikm != NULL)
         return 0;
-    kem_ind = kem_iana2index(suite.kem_id);
-    if (kem_ind == 0) {
+    kem_info = ossl_HPKE_KEM_INFO_find_id(suite.kem_id);
+    if (kem_info == NULL) {
         erv = 0;
         ERR_raise(ERR_LIB_CRYPTO, ERR_R_INTERNAL_ERROR);
         goto err;
@@ -720,12 +469,10 @@ static int hpke_kg_evp(OSSL_LIB_CTX *libctx, const char *propq,
 
     if (hpke_kem_id_nist_curve(suite.kem_id) == 1) {
         *p++ = OSSL_PARAM_construct_utf8_string(OSSL_PKEY_PARAM_GROUP_NAME,
-                                                (char *)hpke_kem_tab[kem_ind]
-                                                .groupname, 0);
+                                                (char *)kem_info->groupname, 0);
         pctx = EVP_PKEY_CTX_new_from_name(libctx, "EC", propq);
     } else {
-        pctx = EVP_PKEY_CTX_new_from_name(libctx, hpke_kem_tab[kem_ind].keytype,
-                                          propq);
+        pctx = EVP_PKEY_CTX_new_from_name(libctx, kem_info->keytype, propq);
     }
     if (pctx == NULL
         || EVP_PKEY_keygen_init(pctx) <= 0) {
@@ -765,38 +512,32 @@ err:
 
 /*
  * @brief randomly pick a suite
- *
  * @param libctx is the context to use
  * @param propq is a properties string
  * @param suite is the result
  * @return 1 for success, otherwise failure
- *
- * If you change the structure of the various *_tab arrays
- * then this code will also need change.
  */
 static int hpke_random_suite(OSSL_LIB_CTX *libctx,
                              const char *propq,
                              OSSL_HPKE_SUITE *suite)
 {
-    unsigned char rval = 0;
-    int nkdfs = OSSL_NELEM(hpke_kdf_tab)-1;
-    int naeads = OSSL_NELEM(hpke_aead_tab)-1;
-    int nkems = OSSL_NELEM(hpke_kem_tab)-1;
+    const OSSL_HPKE_KEM_INFO *kem_info = NULL;
+    const OSSL_HPKE_KDF_INFO *kdf_info = NULL;
+    const OSSL_HPKE_AEAD_INFO *aead_info = NULL;
 
-    /* random kem */
-    if (RAND_bytes_ex(libctx, &rval, sizeof(rval), OSSL_HPKE_RSTRENGTH) <= 0)
+    /* random kem, kdf and aead */
+    kem_info = ossl_HPKE_KEM_INFO_find_random(libctx);
+    if (kem_info == NULL)
         return 0;
-    suite->kem_id = hpke_kem_tab[(rval % nkems + 1)].kem_id;
-
-    /* random kdf */
-    if (RAND_bytes_ex(libctx, &rval, sizeof(rval), OSSL_HPKE_RSTRENGTH) <= 0)
+    suite->kem_id = kem_info->kem_id;
+    kdf_info = ossl_HPKE_KDF_INFO_find_random(libctx);
+    if (kdf_info == NULL)
         return 0;
-    suite->kdf_id = hpke_kdf_tab[(rval % nkdfs + 1)].kdf_id;
-
-    /* random aead, but not exportonly */
-    if (RAND_bytes_ex(libctx, &rval, sizeof(rval), OSSL_HPKE_RSTRENGTH) <= 0)
+    suite->kdf_id = kdf_info->kdf_id;
+    aead_info = ossl_HPKE_AEAD_INFO_find_random(libctx);
+    if (aead_info == NULL)
         return 0;
-    suite->aead_id = hpke_aead_tab[(rval % (naeads - 1) + 1)].aead_id;
+    suite->aead_id = aead_info->aead_id;
     return 1;
 }
 
@@ -816,123 +557,74 @@ static int hpke_random_suite(OSSL_LIB_CTX *libctx,
 static int hpke_get_grease_value(OSSL_LIB_CTX *libctx, const char *propq,
                                  OSSL_HPKE_SUITE *suite_in,
                                  OSSL_HPKE_SUITE *suite,
-                                 unsigned char *pub,
-                                 size_t *pub_len,
-                                 unsigned char *ciphertext,
-                                 size_t ciphertext_len)
+                                 unsigned char *enc,
+                                 size_t *enclen,
+                                 unsigned char *ct,
+                                 size_t ctlen)
 {
     OSSL_HPKE_SUITE chosen;
-    int crv = 0;
-    int erv = 0;
     size_t plen = 0;
-    uint16_t kem_ind = 0;
+    const OSSL_HPKE_KEM_INFO *kem_info = NULL;
+    const OSSL_HPKE_AEAD_INFO *aead_info = NULL;
 
-    if (pub == NULL || !pub_len
-        || ciphertext == NULL || !ciphertext_len || suite == NULL)
+    if (enc == NULL || !enclen
+        || ct == NULL || ctlen == 0 || suite == NULL)
         return 0;
     if (suite_in == NULL) {
         /* choose a random suite */
-        crv = hpke_random_suite(libctx, propq, &chosen);
-        if (crv != 1)
-            return crv;
+        if (hpke_random_suite(libctx, propq, &chosen) != 1) {
+            ERR_raise(ERR_LIB_CRYPTO, ERR_R_INTERNAL_ERROR);
+            goto err;
+        }
     } else {
         chosen = *suite_in;
     }
-    kem_ind = kem_iana2index(chosen.kem_id);
-    if (kem_ind == 0) {
-        erv = 0;
+    kem_info = ossl_HPKE_KEM_INFO_find_id(chosen.kem_id);
+    if (kem_info == NULL) {
         ERR_raise(ERR_LIB_CRYPTO, ERR_R_INTERNAL_ERROR);
         goto err;
     }
-    if ((crv = hpke_suite_check(chosen)) != 1)
-        return 0;
+    aead_info = ossl_HPKE_AEAD_INFO_find_id(chosen.aead_id);
+    if (aead_info == NULL) {
+        ERR_raise(ERR_LIB_CRYPTO, ERR_R_INTERNAL_ERROR);
+        goto err;
+    }
+    if (hpke_suite_check(chosen) != 1) {
+        ERR_raise(ERR_LIB_CRYPTO, ERR_R_INTERNAL_ERROR);
+        goto err;
+    }
     *suite = chosen;
+    /* make sure room for tag and one plaintext octet */
+    if (aead_info->taglen >= ctlen) {
+        ERR_raise(ERR_LIB_CRYPTO, ERR_R_INTERNAL_ERROR);
+        goto err;
+    }
     /* publen */
-    plen = hpke_kem_tab[kem_ind].Npk;
-    if (plen > *pub_len)
-        return 0;
-    if (RAND_bytes_ex(libctx, pub, plen, OSSL_HPKE_RSTRENGTH) <= 0)
-        return 0;
-    *pub_len = plen;
-    if (RAND_bytes_ex(libctx, ciphertext, ciphertext_len,
-                      OSSL_HPKE_RSTRENGTH) <= 0)
-        return 0;
+    plen = kem_info->Npk;
+    if (plen > *enclen) {
+        ERR_raise(ERR_LIB_CRYPTO, ERR_R_INTERNAL_ERROR);
+        goto err;
+    }
+    if (RAND_bytes_ex(libctx, enc, plen, OSSL_HPKE_RSTRENGTH) <= 0) {
+        ERR_raise(ERR_LIB_CRYPTO, ERR_R_INTERNAL_ERROR);
+        goto err;
+    }
+    *enclen = plen;
+    /* if NIST curve chosen set 1st octet to 0x04 */
+    if (hpke_kem_id_nist_curve(chosen.kem_id) == 1) {
+        enc[0] = 0x04;
+    }
+    if (RAND_bytes_ex(libctx, ct, ctlen, OSSL_HPKE_RSTRENGTH) <= 0) {
+        ERR_raise(ERR_LIB_CRYPTO, ERR_R_INTERNAL_ERROR);
+        goto err;
+    }
     return 1;
 err:
-    return erv;
+    return 0;
 }
 
 /*
- * @brief map a string to a HPKE suite
- *
- * @param str is the string value
- * @param suite is the resulting suite
- * @return 1 for success, otherwise failure
- */
-static int hpke_str2suite(const char *suitestr, OSSL_HPKE_SUITE *suite)
-{
-    uint16_t kem = 0, kdf = 0, aead = 0;
-    char *st = NULL;
-    char *instrcp = NULL;
-    size_t inplen = 0;
-    int labels = 0;
-    synonymttab_t *synp = NULL;
-    uint16_t *targ = NULL;
-    size_t i, j;
-    size_t outsize = 0;
-    size_t insize = 0;
-
-    if (suitestr == NULL || suite == NULL)
-        return 0;
-    /* See if it contains a mix of our strings and numbers  */
-    inplen = OPENSSL_strnlen(suitestr, OSSL_HPKE_MAX_SUITESTR);
-    if (inplen >= OSSL_HPKE_MAX_SUITESTR)
-        return 0;
-    instrcp = OPENSSL_strndup(suitestr, inplen);
-    st = strtok(instrcp, ",");
-    if (st == NULL) {
-        OPENSSL_free(instrcp);
-        return 0;
-    }
-    while (st != NULL && ++labels <= 3) {
-        /* check if string is known or number and if so handle appropriately */
-
-        if (kem == 0) {
-            synp = kemstrtab;
-            targ = &kem;
-            outsize = OSSL_NELEM(kemstrtab);
-            insize = OSSL_NELEM(kemstrtab[0].synonyms);
-        } else if (kem != 0 && kdf == 0) {
-            synp = kdfstrtab;
-            targ = &kdf;
-            outsize = OSSL_NELEM(kdfstrtab);
-            insize = OSSL_NELEM(kdfstrtab[0].synonyms);
-        } else if (kem != 0 && kdf != 0 && aead == 0) {
-            synp = aeadstrtab;
-            targ = &aead;
-            outsize = OSSL_NELEM(aeadstrtab);
-            insize = OSSL_NELEM(aeadstrtab[0].synonyms);
-        }
-        for (i = 0; i != outsize && *targ == 0; i++) {
-            for (j = 0; j != insize && *targ == 0; j++) {
-                if (OPENSSL_strcasecmp(st, synp[i].synonyms[j]) == 0)
-                    *targ = synp[i].id;
-            }
-        }
-        st = strtok(NULL, ",");
-    }
-    OPENSSL_free(instrcp);
-    if ((st != NULL && labels > 3) || kem == 0 || kdf == 0 || aead == 0) {
-        return 0;
-    }
-    suite->kem_id = kem;
-    suite->kdf_id = kdf;
-    suite->aead_id = aead;
-    return 1;
-}
-
-/*
- * @brief tell the caller how big the cipertext will be
+ * @brief tell the caller how big the ciphertext will be
  *
  * AEAD algorithms add a tag for data authentication.
  * Those are almost always, but not always, 16 octets
@@ -951,8 +643,8 @@ static int hpke_expansion(OSSL_HPKE_SUITE suite,
                           size_t clearlen,
                           size_t *cipherlen)
 {
-    uint16_t aead_ind = 0;
-    uint16_t kem_ind = 0;
+    const OSSL_HPKE_AEAD_INFO *aead_info = NULL;
+    const OSSL_HPKE_KEM_INFO *kem_info = NULL;
 
     if (cipherlen == NULL || enclen == NULL) {
         ERR_raise(ERR_LIB_CRYPTO, ERR_R_INTERNAL_ERROR);
@@ -962,21 +654,28 @@ static int hpke_expansion(OSSL_HPKE_SUITE suite,
         ERR_raise(ERR_LIB_CRYPTO, ERR_R_INTERNAL_ERROR);
         return 0;
     }
-    aead_ind = aead_iana2index(suite.aead_id);
-    if (aead_ind == 0) {
+    aead_info = ossl_HPKE_AEAD_INFO_find_id(suite.aead_id);
+    if (aead_info == NULL) {
         ERR_raise(ERR_LIB_CRYPTO, ERR_R_INTERNAL_ERROR);
         return 0;
     }
-    *cipherlen = clearlen + hpke_aead_tab[aead_ind].taglen;
-    kem_ind = kem_iana2index(suite.kem_id);
-    if (kem_ind == 0) {
+    *cipherlen = clearlen + aead_info->taglen;
+    kem_info = ossl_HPKE_KEM_INFO_find_id(suite.kem_id);
+    if (kem_info == NULL) {
         ERR_raise(ERR_LIB_CRYPTO, ERR_R_INTERNAL_ERROR);
         return 0;
     }
-    *enclen = hpke_kem_tab[kem_ind].Nenc;
+    *enclen = kem_info->Nenc;
     return 1;
 }
 
+/*
+ * @brief explode out a 64-bit unsigned into a buffer
+ * @param seq the input unsigned value
+ * @param buf is the buffer to explode that into
+ * @blen is the caller-allocated size of buf
+ * @return 0 for error, otherwise blen
+ */
 static size_t hpke_seq2buf(uint64_t seq, unsigned char *buf, size_t blen)
 {
     size_t i;
@@ -990,6 +689,15 @@ static size_t hpke_seq2buf(uint64_t seq, unsigned char *buf, size_t blen)
     return blen;
 }
 
+/*
+ * @brief call the underlying KEM to encap
+ * @param ctx is the OSSL_HPKE_CTX
+ * @param enc is a buffer for the sender's ephemeral public value
+ * @param enclen is the size of enc on input, number of octets used on ouptut
+ * @param pub is the recipient's public value
+ * @param publen is the length of pub
+ * @return 1 for success, 0 for error
+ */
 static int hpke_encap(OSSL_HPKE_CTX *ctx, unsigned char *enc, size_t *enclen,
                       const unsigned char *pub, size_t publen)
 {
@@ -998,27 +706,31 @@ static int hpke_encap(OSSL_HPKE_CTX *ctx, unsigned char *enc, size_t *enclen,
     size_t lsslen = 0;
     EVP_PKEY_CTX *pctx = NULL;
     EVP_PKEY *pkR = NULL;
-    int kem_ind = 0;
+    const OSSL_HPKE_KEM_INFO *kem_info = NULL;
 
     if (ctx == NULL || enc == NULL || enclen == NULL || *enclen == 0
         || pub == NULL || publen == 0) {
         ERR_raise(ERR_LIB_CRYPTO, ERR_R_INTERNAL_ERROR);
         return 0;
     }
-    kem_ind = kem_iana2index(ctx->suite.kem_id);
-    if (kem_ind == 0) {
+    if (ctx->shared_secret != NULL) {
+        /* only run the KEM once per OSSL_HPKE_CTX */
+        ERR_raise(ERR_LIB_CRYPTO, ERR_R_SHOULD_NOT_HAVE_BEEN_CALLED);
+        return 0;
+    }
+    kem_info = ossl_HPKE_KEM_INFO_find_id(ctx->suite.kem_id);
+    if (kem_info == NULL) {
         erv = 0;
         ERR_raise(ERR_LIB_CRYPTO, ERR_R_INTERNAL_ERROR);
         goto err;
     }
     if (hpke_kem_id_nist_curve(ctx->suite.kem_id) == 1) {
         pkR = EVP_PKEY_new_raw_nist_public_key(ctx->libctx, ctx->propq,
-                                               hpke_kem_tab[kem_ind].groupid,
-                                               hpke_kem_tab[kem_ind].groupname,
+                                               kem_info->groupname,
                                                pub, publen);
     } else {
         pkR = EVP_PKEY_new_raw_public_key_ex(ctx->libctx,
-                                             hpke_kem_tab[kem_ind].keytype,
+                                             kem_info->keytype,
                                              ctx->propq, pub, publen);
     }
     if (pkR == NULL) {
@@ -1071,7 +783,6 @@ static int hpke_encap(OSSL_HPKE_CTX *ctx, unsigned char *enc, size_t *enclen,
                                ctx->shared_secret,
                                &ctx->shared_secretlen);
     if (erv != 1) {
-        OPENSSL_clear_free(ctx->shared_secret, ctx->shared_secretlen);
         ctx->shared_secretlen = 0;
         ctx->shared_secret = NULL;
         ERR_raise(ERR_LIB_CRYPTO, ERR_R_INTERNAL_ERROR);
@@ -1083,6 +794,14 @@ err:
     return erv;
 }
 
+/*
+ * @brief call the underlying KEM to decap
+ * @param ctx is the OSSL_HPKE_CTX
+ * @param enc is a buffer for the sender's ephemeral public value
+ * @param enclen is the length of enc
+ * @param priv is the recipeient's private value
+ * @return 1 for success, 0 for error
+ */
 static int hpke_decap(OSSL_HPKE_CTX *ctx,
                       const unsigned char *enc, size_t enclen,
                       EVP_PKEY *priv)
@@ -1091,11 +810,16 @@ static int hpke_decap(OSSL_HPKE_CTX *ctx,
     EVP_PKEY_CTX *pctx = NULL;
     EVP_PKEY *spub = NULL;
     OSSL_PARAM params[3], *p = params;
-    size_t lsslen;
+    size_t lsslen = 0;
     unsigned char lss[OSSL_HPKE_MAXSIZE];
 
     if (ctx == NULL || enc == NULL || enclen == 0 || priv == NULL) {
         ERR_raise(ERR_LIB_CRYPTO, ERR_R_INTERNAL_ERROR);
+        return 0;
+    }
+    if (ctx->shared_secret != NULL) {
+        /* only run the KEM once per OSSL_HPKE_CTX */
+        ERR_raise(ERR_LIB_CRYPTO, ERR_R_SHOULD_NOT_HAVE_BEEN_CALLED);
         return 0;
     }
     pctx = EVP_PKEY_CTX_new_from_pkey(ctx->libctx, priv, ctx->propq);
@@ -1110,25 +834,22 @@ static int hpke_decap(OSSL_HPKE_CTX *ctx,
     *p = OSSL_PARAM_construct_end();
     if (ctx->mode == OSSL_HPKE_MODE_AUTH
         || ctx->mode == OSSL_HPKE_MODE_PSKAUTH) {
-        int kem_ind = 0;
+        const OSSL_HPKE_KEM_INFO *kem_info = NULL;
 
-        kem_ind = kem_iana2index(ctx->suite.kem_id);
-        if (kem_ind == 0) {
+        kem_info = ossl_HPKE_KEM_INFO_find_id(ctx->suite.kem_id);
+        if (kem_info == NULL) {
             erv = 0;
             ERR_raise(ERR_LIB_CRYPTO, ERR_R_INTERNAL_ERROR);
             goto err;
         }
         if (hpke_kem_id_nist_curve(ctx->suite.kem_id) == 1) {
             spub = EVP_PKEY_new_raw_nist_public_key(ctx->libctx, ctx->propq,
-                                                    hpke_kem_tab[kem_ind].
-                                                    groupid,
-                                                    hpke_kem_tab[kem_ind].
-                                                    groupname,
+                                                    kem_info->groupname,
                                                     ctx->authpub,
                                                     ctx->authpublen);
         } else {
             spub = EVP_PKEY_new_raw_public_key_ex(ctx->libctx,
-                                                  hpke_kem_tab[kem_ind].keytype,
+                                                  kem_info->keytype,
                                                   ctx->propq,
                                                   ctx->authpub,
                                                   ctx->authpublen);
@@ -1167,8 +888,6 @@ static int hpke_decap(OSSL_HPKE_CTX *ctx,
     }
     EVP_PKEY_CTX_free(pctx);
     pctx = NULL;
-    /* free shared_secret in case this is 2nd call */
-    OPENSSL_clear_free(ctx->shared_secret, ctx->shared_secretlen);
     ctx->shared_secret = OPENSSL_malloc(lsslen);
     if (ctx->shared_secret == NULL) {
         erv = 0;
@@ -1185,11 +904,18 @@ err:
     return erv;
 }
 
-static int hpke_do_rest(OSSL_HPKE_CTX *ctx, int operation,
-                        unsigned char *ct, size_t *ctlen,
-                        unsigned char *pt, size_t *ptlen,
-                        const unsigned char *info, size_t infolen,
-                        const unsigned char *aad, size_t aadlen)
+/*
+ * @brief do "middle" of HPKE, between KEM and AEAD
+ * @param ctx is the OSSL_HPKE_CTX
+ * @param info is a buffer for the added binding information
+ * @param infolen is the length of info
+ * @return 0 for error, 1 for success
+ *
+ * This does all the HPKE extrcts and expands and sets th ctx
+ * fields for the shared_secret, nonce, key and eporter_secret
+ */
+static int hpke_do_middle(OSSL_HPKE_CTX *ctx,
+                          const unsigned char *info, size_t infolen)
 {
     int erv = 1;
     size_t ks_contextlen = OSSL_HPKE_MAXSIZE;
@@ -1198,32 +924,34 @@ static int hpke_do_rest(OSSL_HPKE_CTX *ctx, int operation,
     size_t pskidlen = 0;
     size_t psk_hashlen = OSSL_HPKE_MAXSIZE;
     unsigned char psk_hash[OSSL_HPKE_MAXSIZE];
-    int kem_ind = 0, kdf_ind = 0, aead_ind = 0;
+    const OSSL_HPKE_AEAD_INFO *aead_info = NULL;
+    const OSSL_HPKE_KDF_INFO *kdf_info = NULL;
     size_t secretlen = OSSL_HPKE_MAXSIZE;
     unsigned char secret[OSSL_HPKE_MAXSIZE];
-    size_t noncelen = OSSL_HPKE_MAXSIZE;
-    unsigned char nonce[OSSL_HPKE_MAXSIZE];
-    unsigned char seqbuf[12];
-    size_t seqlen = 0;
-    size_t keylen = OSSL_HPKE_MAXSIZE;
-    unsigned char key[OSSL_HPKE_MAXSIZE];
     EVP_KDF_CTX *kctx = NULL;
     unsigned char suitebuf[6];
     const char *mdname = NULL;
 
-    if ((kem_ind = kem_iana2index(ctx->suite.kem_id)) == 0) {
+    /* only let this be done once */
+    if (ctx->exportersec != NULL) {
         ERR_raise(ERR_LIB_CRYPTO, ERR_R_INTERNAL_ERROR);
         return 0;
     }
-    if ((aead_ind = aead_iana2index(ctx->suite.aead_id)) == 0) {
+    if (ossl_HPKE_KEM_INFO_find_id(ctx->suite.kem_id) == NULL) {
         ERR_raise(ERR_LIB_CRYPTO, ERR_R_INTERNAL_ERROR);
         return 0;
     }
-    if ((kdf_ind = kdf_iana2index(ctx->suite.kdf_id)) == 0) {
+    aead_info = ossl_HPKE_AEAD_INFO_find_id(ctx->suite.aead_id);
+    if (aead_info == NULL) {
         ERR_raise(ERR_LIB_CRYPTO, ERR_R_INTERNAL_ERROR);
         return 0;
     }
-    mdname = hpke_kdf_tab[kdf_ind].mdname;
+    kdf_info = ossl_HPKE_KDF_INFO_find_id(ctx->suite.kdf_id);
+    if (kdf_info == NULL) {
+        ERR_raise(ERR_LIB_CRYPTO, ERR_R_INTERNAL_ERROR);
+        return 0;
+    }
+    mdname = kdf_info->mdname;
     kctx = ossl_kdf_ctx_create("HKDF", mdname, ctx->libctx, ctx->propq);
     if (kctx == NULL) {
         ERR_raise(ERR_LIB_CRYPTO, ERR_R_INTERNAL_ERROR);
@@ -1233,11 +961,10 @@ static int hpke_do_rest(OSSL_HPKE_CTX *ctx, int operation,
     memset(ks_context, 0, sizeof(ks_context));
     ks_context[0] = (unsigned char)(ctx->mode % 256);
     ks_contextlen--; /* remaining space */
-    halflen = hpke_kdf_tab[kdf_ind].Nh;
+    halflen = kdf_info->Nh;
     if ((2 * halflen) > ks_contextlen) {
-        erv = 0;
         ERR_raise(ERR_LIB_CRYPTO, ERR_R_INTERNAL_ERROR);
-        goto err;
+        return 0;
     }
     pskidlen = (ctx->psk == NULL ? 0 : strlen(ctx->pskid));
     /* mode == FULL as per RFC9180 sec 5.1 */
@@ -1249,7 +976,8 @@ static int hpke_do_rest(OSSL_HPKE_CTX *ctx, int operation,
     suitebuf[5] = ctx->suite.aead_id % 256;
     erv = ossl_hpke_labeled_extract(kctx, ks_context + 1, halflen,
                                     NULL, 0, OSSL_HPKE_SEC51LABEL,
-                                    suitebuf, 6, OSSL_HPKE_PSKIDHASH_LABEL,
+                                    suitebuf, sizeof(suitebuf),
+                                    OSSL_HPKE_PSKIDHASH_LABEL,
                                     (unsigned char *)ctx->pskid, pskidlen);
     if (erv != 1) {
         ERR_raise(ERR_LIB_CRYPTO, ERR_R_INTERNAL_ERROR);
@@ -1257,7 +985,8 @@ static int hpke_do_rest(OSSL_HPKE_CTX *ctx, int operation,
     }
     erv = ossl_hpke_labeled_extract(kctx, ks_context + 1 + halflen, halflen,
                                     NULL, 0, OSSL_HPKE_SEC51LABEL,
-                                    suitebuf, 6, OSSL_HPKE_INFOHASH_LABEL,
+                                    suitebuf, sizeof(suitebuf),
+                                    OSSL_HPKE_INFOHASH_LABEL,
                                     (unsigned char *)info, infolen);
     if (erv != 1) {
         ERR_raise(ERR_LIB_CRYPTO, ERR_R_INTERNAL_ERROR);
@@ -1268,108 +997,77 @@ static int hpke_do_rest(OSSL_HPKE_CTX *ctx, int operation,
     psk_hashlen = halflen;
     erv = ossl_hpke_labeled_extract(kctx, psk_hash, psk_hashlen,
                                     NULL, 0, OSSL_HPKE_SEC51LABEL,
-                                    suitebuf, 6, OSSL_HPKE_PSK_HASH_LABEL,
+                                    suitebuf, sizeof(suitebuf),
+                                    OSSL_HPKE_PSK_HASH_LABEL,
                                     ctx->psk, ctx->psklen);
     if (erv != 1) {
         ERR_raise(ERR_LIB_CRYPTO, ERR_R_INTERNAL_ERROR);
         goto err;
     }
-    secretlen = hpke_kdf_tab[kdf_ind].Nh;
-    if (secretlen > SHA512_DIGEST_LENGTH) {
+    secretlen = kdf_info->Nh;
+    if (secretlen > OSSL_HPKE_MAXSIZE) {
         erv = 0;
         ERR_raise(ERR_LIB_CRYPTO, ERR_R_INTERNAL_ERROR);
         goto err;
     }
     erv = ossl_hpke_labeled_extract(kctx, secret, secretlen,
                                     ctx->shared_secret, ctx->shared_secretlen,
-                                    OSSL_HPKE_SEC51LABEL, suitebuf, 6,
+                                    OSSL_HPKE_SEC51LABEL,
+                                    suitebuf, sizeof(suitebuf),
                                     OSSL_HPKE_SECRET_LABEL,
                                     ctx->psk, ctx->psklen);
     if (erv != 1) {
         ERR_raise(ERR_LIB_CRYPTO, ERR_R_INTERNAL_ERROR);
         goto err;
     }
-    /*
-     * if we're doing a real encrypt or decrypt we need nonce
-     * and secret, but not if we're only exporting
-     */
-    if (operation != OSSL_HPKE_OP_EXPONLY) {
-        noncelen = hpke_aead_tab[aead_ind].Nn;
-        erv = ossl_hpke_labeled_expand(kctx, nonce, noncelen,
+    if (ctx->suite.aead_id != OSSL_HPKE_AEAD_ID_EXPORTONLY) {
+        /* we only need nonce/key for non export AEADs */
+        ctx->noncelen = aead_info->Nn;
+        ctx->nonce = OPENSSL_malloc(ctx->noncelen);
+        if (ctx->nonce == NULL) {
+            erv = 0;
+            ERR_raise(ERR_LIB_CRYPTO, ERR_R_INTERNAL_ERROR);
+            goto err;
+        }
+        erv = ossl_hpke_labeled_expand(kctx, ctx->nonce, ctx->noncelen,
                                        secret, secretlen, OSSL_HPKE_SEC51LABEL,
-                                       suitebuf, 6, OSSL_HPKE_NONCE_LABEL,
+                                       suitebuf, sizeof(suitebuf),
+                                       OSSL_HPKE_NONCE_LABEL,
                                        ks_context, ks_contextlen);
         if (erv != 1) {
             ERR_raise(ERR_LIB_CRYPTO, ERR_R_INTERNAL_ERROR);
             goto err;
         }
-        seqlen = hpke_seq2buf(ctx->seq, seqbuf, 12);
-        if (seqlen == 0) {
+        ctx->keylen = aead_info->Nk;
+        ctx->key = OPENSSL_malloc(ctx->keylen);
+        if (ctx->key == NULL) {
             erv = 0;
             ERR_raise(ERR_LIB_CRYPTO, ERR_R_INTERNAL_ERROR);
             goto err;
-        } else {
-            size_t sind;
-            unsigned char cv;
-
-            if (seqlen > noncelen) {
-                erv = 0;
-                ERR_raise(ERR_LIB_CRYPTO, ERR_R_INTERNAL_ERROR);
-                goto err;
-            }
-            /* non constant time - does it matter? maybe no */
-            for (sind = 0; sind != noncelen; sind++) {
-                if (sind < seqlen) {
-                    cv = seqbuf[seqlen - 1 - (sind % seqlen)];
-                } else {
-                    cv = 0x00;
-                }
-                nonce[noncelen - 1 - sind] ^= cv;
-            }
         }
-        keylen = hpke_aead_tab[aead_ind].Nk;
-        erv = ossl_hpke_labeled_expand(kctx, key, keylen,
+        erv = ossl_hpke_labeled_expand(kctx, ctx->key, ctx->keylen,
                                        secret, secretlen, OSSL_HPKE_SEC51LABEL,
-                                       suitebuf, 6, OSSL_HPKE_KEY_LABEL,
+                                       suitebuf, sizeof(suitebuf),
+                                       OSSL_HPKE_KEY_LABEL,
                                        ks_context, ks_contextlen);
         if (erv != 1) {
             ERR_raise(ERR_LIB_CRYPTO, ERR_R_INTERNAL_ERROR);
             goto err;
         }
     }
+    ctx->exporterseclen = kdf_info->Nh;
+    ctx->exportersec = OPENSSL_malloc(ctx->exporterseclen);
     if (ctx->exportersec == NULL) {
-        ctx->exporterseclen = hpke_kdf_tab[kdf_ind].Nh;
-        ctx->exportersec = OPENSSL_malloc(ctx->exporterseclen);
-        if (ctx->exportersec == NULL) {
-            erv = 0;
-            ERR_raise(ERR_LIB_CRYPTO, ERR_R_INTERNAL_ERROR);
-            goto err;
-        }
-        erv = ossl_hpke_labeled_expand(kctx,
-                                       ctx->exportersec, ctx->exporterseclen,
-                                       secret, secretlen, OSSL_HPKE_SEC51LABEL,
-                                       suitebuf, 6, OSSL_HPKE_EXP_LABEL,
-                                       ks_context, ks_contextlen);
-        if (erv != 1) {
-            ERR_raise(ERR_LIB_CRYPTO, ERR_R_INTERNAL_ERROR);
-            goto err;
-        }
+        erv = 0;
+        ERR_raise(ERR_LIB_CRYPTO, ERR_R_INTERNAL_ERROR);
+        goto err;
     }
-    /*
-     * operation can be to encrypt or decrypt or other (used
-     * when doing export-only
-     */
-    if (operation == OSSL_HPKE_OP_ENC) {
-        erv = hpke_aead_enc(ctx->libctx, ctx->propq, ctx->suite,
-                            key, keylen, nonce, noncelen,
-                            aad, aadlen, pt, *ptlen, ct, ctlen);
-    } else if (operation == OSSL_HPKE_OP_DEC) {
-        erv = hpke_aead_dec(ctx->libctx, ctx->propq, ctx->suite,
-                            key, keylen, nonce, noncelen,
-                            aad, aadlen, ct, *ctlen, pt, ptlen);
-    } else if (operation == OSSL_HPKE_OP_EXPONLY) {
-        erv = 1;
-    }
+    erv = ossl_hpke_labeled_expand(kctx,
+                                   ctx->exportersec, ctx->exporterseclen,
+                                   secret, secretlen, OSSL_HPKE_SEC51LABEL,
+                                   suitebuf, sizeof(suitebuf),
+                                   OSSL_HPKE_EXP_LABEL,
+                                   ks_context, ks_contextlen);
     if (erv != 1) {
         ERR_raise(ERR_LIB_CRYPTO, ERR_R_INTERNAL_ERROR);
         goto err;
@@ -1379,22 +1077,15 @@ err:
     OPENSSL_cleanse(ks_context, OSSL_HPKE_MAXSIZE);
     OPENSSL_cleanse(psk_hash, OSSL_HPKE_MAXSIZE);
     OPENSSL_cleanse(secret, OSSL_HPKE_MAXSIZE);
-    OPENSSL_cleanse(nonce, OSSL_HPKE_MAXSIZE);
-    OPENSSL_cleanse(key, OSSL_HPKE_MAXSIZE);
     EVP_KDF_CTX_free(kctx);
     return erv;
 }
 
-/* externally visible functions from below here */
-
-/**
- * @brief contex creator
- * @param mode is the desired HPKE mode
- * @param suite specifies the KEM, KDF and AEAD to use
- * @param libctx is the context to use
- * @param propq is a properties string
- * @return pointer to new context or NULL if error
+/*
+ * externally visible functions from below here, API documentation is
+ * in doc/man3/OSSL_HPKE_CTX_new.pod to avoid duplication
  */
+
 OSSL_HPKE_CTX *OSSL_HPKE_CTX_new(int mode, OSSL_HPKE_SUITE suite,
                                  OSSL_LIB_CTX *libctx, const char *propq)
 {
@@ -1403,8 +1094,6 @@ OSSL_HPKE_CTX *OSSL_HPKE_CTX_new(int mode, OSSL_HPKE_SUITE suite,
     if (hpke_mode_check(mode) != 1)
         return NULL;
     if (hpke_suite_check(suite) != 1)
-        return NULL;
-    if (mode < 0 || mode > OSSL_HPKE_MODE_PSKAUTH)
         return NULL;
     ctx = OPENSSL_zalloc(sizeof(OSSL_HPKE_CTX));
     if (ctx == NULL)
@@ -1424,10 +1113,6 @@ err:
     return NULL;
 }
 
-/**
- * @brief free up storage for a HPKE context
- * @param ctx is the pointer to be free'd (can be NULL)
- */
 void OSSL_HPKE_CTX_free(OSSL_HPKE_CTX *ctx)
 {
     if (ctx == NULL)
@@ -1436,24 +1121,17 @@ void OSSL_HPKE_CTX_free(OSSL_HPKE_CTX *ctx)
     OPENSSL_clear_free(ctx->exportersec, ctx->exporterseclen);
     OPENSSL_free(ctx->pskid);
     OPENSSL_clear_free(ctx->psk, ctx->psklen);
+    OPENSSL_clear_free(ctx->key, ctx->keylen);
+    OPENSSL_clear_free(ctx->nonce, ctx->noncelen);
     OPENSSL_clear_free(ctx->shared_secret, ctx->shared_secretlen);
     OPENSSL_clear_free(ctx->ikme, ctx->ikmelen);
     EVP_PKEY_free(ctx->authpriv);
-    OPENSSL_free(ctx->info);
     OPENSSL_free(ctx->authpub);
 
     OPENSSL_free(ctx);
     return;
 }
 
-/**
- * @brief set a PSK for an HPKE context
- * @param ctx is the pointer for the HPKE context
- * @param pskid is a string identifying the PSK
- * @param psk is the PSK buffer
- * @param psklen is the size of the PSK
- * @return 1 for success, 0 for error
- */
 int OSSL_HPKE_CTX_set1_psk(OSSL_HPKE_CTX *ctx,
                            const char *pskid,
                            const unsigned char *psk, size_t psklen)
@@ -1487,13 +1165,6 @@ err:
     return 0;
 }
 
-/**
- * @brief set a sender IKM for key DHKEM generation
- * @param ctx is the pointer for the HPKE context
- * @param ikme is a buffer for the IKM
- * @param ikmelen is the length of the above
- * @return 1 for success, 0 for error
- */
 int OSSL_HPKE_CTX_set1_ikme(OSSL_HPKE_CTX *ctx,
                             const unsigned char *ikme, size_t ikmelen)
 {
@@ -1510,15 +1181,9 @@ int OSSL_HPKE_CTX_set1_ikme(OSSL_HPKE_CTX *ctx,
     return 1;
 }
 
-/**
- * @brief set a private key for HPKE authenticated modes
- * @param ctx is the pointer for the HPKE context
- * @param privp is an EVP_PKEY form of the private key
- * @return 1 for success, 0 for error
- */
-int OSSL_HPKE_CTX_set1_authpriv(OSSL_HPKE_CTX *ctx, EVP_PKEY *privp)
+int OSSL_HPKE_CTX_set1_authpriv(OSSL_HPKE_CTX *ctx, EVP_PKEY *priv)
 {
-    if (ctx == NULL || privp == NULL) {
+    if (ctx == NULL || priv == NULL) {
         ERR_raise(ERR_LIB_CRYPTO, ERR_R_INTERNAL_ERROR);
         return 0;
     }
@@ -1529,19 +1194,12 @@ int OSSL_HPKE_CTX_set1_authpriv(OSSL_HPKE_CTX *ctx, EVP_PKEY *privp)
     }
     if (ctx->authpriv != NULL)
         EVP_PKEY_free(ctx->authpriv);
-    ctx->authpriv = EVP_PKEY_dup(privp);
+    ctx->authpriv = EVP_PKEY_dup(priv);
     if (ctx->authpriv == NULL)
         return 0;
     return 1;
 }
 
-/**
- * @brief set a public key for HPKE authenticated modes
- * @param ctx is the pointer for the HPKE context
- * @param pub is an buffer form of the public key
- * @param publen is the length of the above
- * @return 1 for success, 0 for error
- */
 int OSSL_HPKE_CTX_set1_authpub(OSSL_HPKE_CTX *ctx,
                                const unsigned char *pub, size_t publen)
 {
@@ -1557,16 +1215,7 @@ int OSSL_HPKE_CTX_set1_authpub(OSSL_HPKE_CTX *ctx,
     return 1;
 }
 
-/**
- * @brief ask for the state of the sequence of seal/open calls
- * @param ctx is the pointer for the HPKE context
- * @param seq returns the positive integer sequence number
- * @return 1 for success, 0 for error
- *
- * The value returned is the most recent used when sealing
- * or opening (successfully)
- */
-int OSSL_HPKE_CTX_get0_seq(OSSL_HPKE_CTX *ctx, uint64_t *seq)
+int OSSL_HPKE_CTX_get_seq(OSSL_HPKE_CTX *ctx, uint64_t *seq)
 {
     if (ctx == NULL || seq == NULL)
         return 0;
@@ -1574,16 +1223,7 @@ int OSSL_HPKE_CTX_get0_seq(OSSL_HPKE_CTX *ctx, uint64_t *seq)
     return 1;
 }
 
-/**
- * @brief set the sequence value for seal/open calls
- * @param ctx is the pointer for the HPKE context
- * @param seq set the positive integer sequence number
- * @return 1 for success, 0 for error
- *
- * The value returned is the most recent used when sealing
- * or opening (successfully)
- */
-int OSSL_HPKE_CTX_set1_seq(OSSL_HPKE_CTX *ctx, uint64_t seq)
+int OSSL_HPKE_CTX_set_seq(OSSL_HPKE_CTX *ctx, uint64_t seq)
 {
     if (ctx == NULL)
         return 0;
@@ -1591,296 +1231,19 @@ int OSSL_HPKE_CTX_set1_seq(OSSL_HPKE_CTX *ctx, uint64_t seq)
     return 1;
 }
 
-/**
- * @brief sender seal function
- * @param ctx is the pointer for the HPKE context
- * @param enc is the sender's ephemeral public value
- * @param enclen is the size the above
- * @param ct is the ciphertext output
- * @param ctlen is the size the above
- * @param pub is the recipient public key octets
- * @param publen is the size the above
- * @param infolen is the size the above
- * @param info is the key schedule info parameter
- * @param infolen is the size the above
- * @param info is the info parameter
- * @param infolen is the size the above
- * @param aad is the aad parameter
- * @param aadlen is the size the above
- * @param pt is the plaintext
- * @param ptlen is the size the above
- * @return 1 for success, 0 for error
- *
- * This can be called multiple times
- */
-int OSSL_HPKE_sender_seal(OSSL_HPKE_CTX *ctx,
-                          unsigned char *enc, size_t *enclen,
-                          unsigned char *ct, size_t *ctlen,
-                          unsigned char *pub, size_t publen,
-                          const unsigned char *info, size_t infolen,
-                          const unsigned char *aad, size_t aadlen,
-                          const unsigned char *pt, size_t ptlen)
-{
-    int erv = 1;
-
-    if (ctx == NULL || enc == NULL || enclen == NULL || *enclen == 0
-        || ct == NULL || ctlen == NULL || *ctlen == 0
-        || pub == NULL || publen == 0 || pt == NULL || ptlen == 0) {
-        ERR_raise(ERR_LIB_CRYPTO, ERR_R_INTERNAL_ERROR);
-        return 0;
-    }
-
-    if (ctx->shared_secret == NULL) {
-        erv = hpke_encap(ctx, enc, enclen, pub, publen);
-        if (erv != 1) {
-            ERR_raise(ERR_LIB_CRYPTO, ERR_R_INTERNAL_ERROR);
-            return 0;
-        }
-    }
-    erv = hpke_do_rest(ctx, OSSL_HPKE_OP_ENC, ct, ctlen,
-                       (unsigned char *)pt, &ptlen,
-                       info, infolen, aad, aadlen);
-    if (erv != 1) {
-        ERR_raise(ERR_LIB_CRYPTO, ERR_R_INTERNAL_ERROR);
-        return 0;
-    } else {
-        ctx->seq++;
-    }
-    return erv;
-}
-
-/**
- * @brief recipient open function
- * @param ctx is the pointer for the HPKE context
- * @param pt is the plaintext
- * @param ptlen is the size the above
- * @param enc is the sender's ephemeral public value
- * @param enclen is the size the above
- * @param recippriv is the EVP_PKEY form of recipient private value
- * @param info is the info parameter
- * @param infolen is the size the above
- * @param aad is the aad parameter
- * @param aadlen is the size the above
- * @param ct is the ciphertext output
- * @param ctlen is the size the above
- * @return 1 for success, 0 for error
- *
- * This can be called multiple times.
- */
-int OSSL_HPKE_recipient_open(OSSL_HPKE_CTX *ctx,
-                             unsigned char *pt, size_t *ptlen,
-                             const unsigned char *enc, size_t enclen,
-                             EVP_PKEY *recippriv,
-                             const unsigned char *info, size_t infolen,
-                             const unsigned char *aad, size_t aadlen,
-                             const unsigned char *ct, size_t ctlen)
-{
-    int erv = 1;
-
-    if (ctx == NULL || pt == NULL || ptlen == NULL || *ptlen == 0
-        || enc == NULL || enclen == 0 || ct == NULL || ctlen == 0
-        || recippriv == NULL || ct == NULL || ctlen == 0) {
-        ERR_raise(ERR_LIB_CRYPTO, ERR_R_INTERNAL_ERROR);
-        return 0;
-    }
-    if (ctx->shared_secret == NULL) {
-        erv = hpke_decap(ctx, enc, enclen, recippriv);
-        if (erv != 1) {
-            ERR_raise(ERR_LIB_CRYPTO, ERR_R_INTERNAL_ERROR);
-            return 0;
-        }
-    }
-    erv = hpke_do_rest(ctx, OSSL_HPKE_OP_DEC, (unsigned char *)ct, &ctlen,
-                       pt, ptlen, info, infolen, aad, aadlen);
-    if (erv != 1) {
-        ERR_raise(ERR_LIB_CRYPTO, ERR_R_INTERNAL_ERROR);
-        return 0;
-    } else {
-        ctx->seq++;
-    }
-    return erv;
-}
-
-/**
- * @brief sender export-only encapsulation function
- * @param ctx is the pointer for the HPKE context
- * @param enc is the sender's ephemeral public value
- * @param enclen is the size the above
- * @param pub is the recipient public key octets
- * @param publen is the size the above
- * @param info is the info parameter
- * @param infolen is the size the above
- * @return 1 for success, 0 for error
- *
- * Following this, OSSL_HPKE_CTX_export can be called.
- */
-int OSSL_HPKE_sender_export_encap(OSSL_HPKE_CTX *ctx,
-                                  unsigned char *enc, size_t *enclen,
-                                  unsigned char *pub, size_t publen,
-                                  const unsigned char *info, size_t infolen)
-{
-    int erv = 1;
-
-    if (ctx == NULL || enc == NULL || enclen == NULL
-        || pub == NULL || publen == 0)
-        return 0;
-    if (ctx->suite.aead_id != OSSL_HPKE_AEAD_ID_EXPORTONLY) {
-        ERR_raise(ERR_LIB_CRYPTO, ERR_R_INTERNAL_ERROR);
-        return 0;
-    }
-    if (ctx->shared_secret == NULL) {
-        erv = hpke_encap(ctx, enc, enclen, pub, publen);
-        if (erv != 1) {
-            ERR_raise(ERR_LIB_CRYPTO, ERR_R_INTERNAL_ERROR);
-            return 0;
-        }
-    }
-    erv = hpke_do_rest(ctx, OSSL_HPKE_OP_EXPONLY, NULL, 0, NULL, 0,
-                       info, infolen, NULL, 0);
-    if (erv != 1) {
-        ERR_raise(ERR_LIB_CRYPTO, ERR_R_INTERNAL_ERROR);
-        return 0;
-    } else {
-        ctx->seq++;
-    }
-    return 1;
-}
-
-/**
- * @brief recipient export-only encapsulation function
- * @param ctx is the pointer for the HPKE context
- * @param enc is the sender's ephemeral public value
- * @param enclen is the size the above
- * @param recippriv is the EVP_PKEY form of recipient private value
- * @param info is the info parameter
- * @param infolen is the size the above
- * @return 1 for success, 0 for error
- *
- * Following this, OSSL_HPKE_CTX_export can be called.
- */
-int OSSL_HPKE_recipient_export_decap(OSSL_HPKE_CTX *ctx,
-                                     const unsigned char *enc, size_t enclen,
-                                     EVP_PKEY *recippriv,
-                                     const unsigned char *info, size_t infolen)
-{
-    int erv = 1;
-
-    if (ctx == NULL || enc == NULL || enclen == 0 || recippriv == NULL)
-        return 0;
-    if (ctx->suite.aead_id != OSSL_HPKE_AEAD_ID_EXPORTONLY) {
-        ERR_raise(ERR_LIB_CRYPTO, ERR_R_INTERNAL_ERROR);
-        return 0;
-    }
-    if (ctx->shared_secret == NULL) {
-        erv = hpke_decap(ctx, enc, enclen, recippriv);
-        if (erv != 1) {
-            ERR_raise(ERR_LIB_CRYPTO, ERR_R_INTERNAL_ERROR);
-            return 0;
-        }
-    }
-    erv = hpke_do_rest(ctx, OSSL_HPKE_OP_EXPONLY, NULL, 0, NULL, 0,
-                       info, infolen, NULL, 0);
-    if (erv != 1) {
-        ERR_raise(ERR_LIB_CRYPTO, ERR_R_INTERNAL_ERROR);
-        return 0;
-    } else {
-        ctx->seq++;
-    }
-    return 1;
-}
-
-/**
- * @brief generate a given-length secret based on context and label
- * @param ctx is the HPKE context
- * @param secret is the resulting secret that will be of length...
- * @param secretlen is the desired output length
- * @param label is a buffer to provide separation between secrets
- * @param labellen is the length of the above
- * @return 1 for good, 0 for error
- *
- * The context has to have been used already for one encryption
- * or decryption for this to work (as this is based on the negotiated
- * "exporter_secret" estabilshed via the HPKE operation.
- */
-int OSSL_HPKE_export(OSSL_HPKE_CTX *ctx,
-                     unsigned char *secret, size_t secretlen,
-                     const unsigned char *label, size_t labellen)
-{
-    int erv = 1;
-    EVP_KDF_CTX *kctx = NULL;
-    unsigned char suitebuf[6];
-    const char *mdname = NULL;
-    int kdf_ind = 0;
-
-    if (ctx == NULL) {
-        ERR_raise(ERR_LIB_CRYPTO, ERR_R_INTERNAL_ERROR);
-        return 0;
-    }
-    if (ctx->exportersec == NULL) {
-        ERR_raise(ERR_LIB_CRYPTO, ERR_R_INTERNAL_ERROR);
-        return 0;
-    }
-    kdf_ind = kdf_iana2index(ctx->suite.kdf_id);
-    if (kdf_ind == 0) {
-        erv = 0;
-        ERR_raise(ERR_LIB_CRYPTO, ERR_R_INTERNAL_ERROR);
-        return 0;
-    }
-    mdname = hpke_kdf_tab[kdf_ind].mdname;
-    kctx = ossl_kdf_ctx_create("HKDF", mdname, ctx->libctx, ctx->propq);
-    if (kctx == NULL) {
-        ERR_raise(ERR_LIB_CRYPTO, ERR_R_INTERNAL_ERROR);
-        return 0;
-    }
-    /* mode == FULL as per RFC9180 sec 5.1 */
-    suitebuf[0] = ctx->suite.kem_id / 256;
-    suitebuf[1] = ctx->suite.kem_id % 256;
-    suitebuf[2] = ctx->suite.kdf_id / 256;
-    suitebuf[3] = ctx->suite.kdf_id % 256;
-    suitebuf[4] = ctx->suite.aead_id / 256;
-    suitebuf[5] = ctx->suite.aead_id % 256;
-    erv = ossl_hpke_labeled_expand(kctx,
-                                   secret, secretlen,
-                                   ctx->exportersec, ctx->exporterseclen,
-                                   OSSL_HPKE_SEC51LABEL,
-                                   suitebuf, 6,
-                                   OSSL_HPKE_EXP_SEC_LABEL,
-                                   label, labellen);
-    EVP_KDF_CTX_free(kctx);
-    if (erv != 1) {
-        ERR_raise(ERR_LIB_CRYPTO, ERR_R_INTERNAL_ERROR);
-        return 0;
-    }
-    return 1;
-}
-
-/*
- * Some even newer APIs below that separate out encap/decap from
- * seal/open/export
- */
-
-/**
- * @brief sender encapsulation function
- * @param ctx is the pointer for the HPKE context
- * @param enc is the sender's ephemeral public value
- * @param enclen is the size the above
- * @param pub is the recipient public key octets
- * @param publen is the size the above
- * @param info is the info parameter
- * @param infolen is the size the above
- * @return 1 for success, 0 for error
- */
 int OSSL_HPKE_encap(OSSL_HPKE_CTX *ctx,
                     unsigned char *enc, size_t *enclen,
-                    unsigned char *pub, size_t publen,
+                    const unsigned char *pub, size_t publen,
                     const unsigned char *info, size_t infolen)
 {
+    int erv = 1;
+
     if (ctx == NULL || enc == NULL || enclen == NULL || *enclen == 0
         || pub == NULL || publen == 0) {
         ERR_raise(ERR_LIB_CRYPTO, ERR_R_PASSED_NULL_PARAMETER);
         return 0;
     }
-    if (ctx->shared_secret != NULL || ctx->info != NULL) {
+    if (ctx->shared_secret != NULL) {
         /* only allow one encap per OSSL_HPKE_CTX */
         ERR_raise(ERR_LIB_CRYPTO, ERR_R_SHOULD_NOT_HAVE_BEEN_CALLED);
         return 0;
@@ -1889,34 +1252,15 @@ int OSSL_HPKE_encap(OSSL_HPKE_CTX *ctx,
         ERR_raise(ERR_LIB_CRYPTO, ERR_R_INTERNAL_ERROR);
         return 0;
     }
-    if (info != NULL) {
-        if (infolen == 0) {
-            ERR_raise(ERR_LIB_CRYPTO, ERR_R_PASSED_INVALID_ARGUMENT);
-            return 0;
-        }
-        ctx->info = OPENSSL_malloc(infolen);
-        if (ctx->info == NULL) {
-            ERR_raise(ERR_LIB_CRYPTO, ERR_R_MALLOC_FAILURE);
-            return 0;
-        }
-        memcpy(ctx->info, info, infolen);
-        ctx->infolen = infolen;
-    }
-    return 1;
+    /*
+     * note that the info is not part of the context as it
+     * only needs to be used once here so doesn't need to
+     * be stored
+     */
+    erv = hpke_do_middle(ctx, info, infolen);
+    return erv;
 }
 
-/**
- * @brief recipient decapsulation function
- * @param ctx is the pointer for the HPKE context
- * @param enc is the sender's ephemeral public value
- * @param enclen is the size the above
- * @param recippriv is the EVP_PKEY form of recipient private value
- * @param info is the info parameter
- * @param infolen is the size the above
- * @return 1 for success, 0 for error
- *
- * Following this, OSSL_HPKE_CTX_export can be called.
- */
 int OSSL_HPKE_decap(OSSL_HPKE_CTX *ctx,
                     const unsigned char *enc, size_t enclen,
                     EVP_PKEY *recippriv,
@@ -1938,191 +1282,229 @@ int OSSL_HPKE_decap(OSSL_HPKE_CTX *ctx,
         ERR_raise(ERR_LIB_CRYPTO, ERR_R_INTERNAL_ERROR);
         return 0;
     }
-    if (info != NULL) {
-        if (infolen == 0) {
-            ERR_raise(ERR_LIB_CRYPTO, ERR_R_PASSED_INVALID_ARGUMENT);
-            return 0;
-        }
-        ctx->info = OPENSSL_malloc(infolen);
-        if (ctx->info == NULL) {
-            ERR_raise(ERR_LIB_CRYPTO, ERR_R_MALLOC_FAILURE);
-            return 0;
-        }
-        memcpy(ctx->info, info, infolen);
-        ctx->infolen = infolen;
-    }
-    return 1;
+    /*
+     * note that the info is not part of the context as it
+     * only needs to be used once here so doesn't need to
+     * be stored
+     */
+    erv = hpke_do_middle(ctx, info, infolen);
+    return erv;
 }
 
-/**
- * @brief new sender seal function
- * @param ctx is the pointer for the HPKE context
- * @param ct is the ciphertext output
- * @param ctlen is the size the above
- * @param aad is the aad parameter
- * @param aadlen is the size the above
- * @param pt is the plaintext
- * @param ptlen is the size the above
- * @return 1 for success, 0 for error
- *
- * This can be called multiple times
- */
 int OSSL_HPKE_seal(OSSL_HPKE_CTX *ctx,
                    unsigned char *ct, size_t *ctlen,
                    const unsigned char *aad, size_t aadlen,
                    const unsigned char *pt, size_t ptlen)
 {
     int erv = 1;
+    unsigned char seqbuf[12];
+    size_t seqlen = 0;
+    unsigned char nonce[12];
 
     if (ctx == NULL || ct == NULL || ctlen == NULL || *ctlen == 0
         || pt == NULL || ptlen == 0) {
         ERR_raise(ERR_LIB_CRYPTO, ERR_R_PASSED_INVALID_ARGUMENT);
         return 0;
     }
-    if (ctx->shared_secret == NULL) {
+    if (ctx->key == NULL || ctx->nonce == NULL) {
         /* need to have done an encap first, info can be NULL */
         ERR_raise(ERR_LIB_CRYPTO, ERR_R_SHOULD_NOT_HAVE_BEEN_CALLED);
         return 0;
     }
-    erv = hpke_do_rest(ctx, OSSL_HPKE_OP_ENC, ct, ctlen,
-                       (unsigned char *)pt, &ptlen,
-                       ctx->info, ctx->infolen, aad, aadlen);
+
+    if (ctx->noncelen > sizeof(nonce)) {
+        ERR_raise(ERR_LIB_CRYPTO, ERR_R_SHOULD_NOT_HAVE_BEEN_CALLED);
+        return 0;
+    }
+    seqlen = hpke_seq2buf(ctx->seq, seqbuf, sizeof(seqbuf));
+    if (seqlen == 0) {
+        erv = 0;
+        ERR_raise(ERR_LIB_CRYPTO, ERR_R_INTERNAL_ERROR);
+        goto err;
+    } else {
+        size_t sind;
+        unsigned char cv;
+
+        if (seqlen > ctx->noncelen) {
+            erv = 0;
+            ERR_raise(ERR_LIB_CRYPTO, ERR_R_INTERNAL_ERROR);
+            goto err;
+        }
+        /* non constant time - does it matter? maybe no */
+        for (sind = 0; sind != ctx->noncelen; sind++) {
+            nonce[ctx->noncelen - 1 - sind] =
+                ctx->nonce[ctx->noncelen - 1 - sind];
+            if (sind < seqlen) {
+                cv = seqbuf[seqlen - 1 - (sind % seqlen)];
+            } else {
+                cv = 0x00;
+            }
+            nonce[ctx->noncelen - 1 - sind] ^= cv;
+        }
+    }
+
+    erv = hpke_aead_enc(ctx->libctx, ctx->propq, ctx->suite,
+                        ctx->key, ctx->keylen, nonce, ctx->noncelen,
+                        aad, aadlen, pt, ptlen, ct, ctlen);
     if (erv != 1) {
         ERR_raise(ERR_LIB_CRYPTO, ERR_R_INTERNAL_ERROR);
         return 0;
     } else {
         ctx->seq++;
     }
+err:
+    OPENSSL_cleanse(nonce, ctx->noncelen);
     return 1;
 }
 
-/**
- * @brief new sender seal function
- * @param ctx is the pointer for the HPKE context
- * @param ct is the ciphertext output
- * @param ctlen is the size the above
- * @param aad is the aad parameter
- * @param aadlen is the size the above
- * @param pt is the plaintext
- * @param ptlen is the size the above
- * @return 1 for success, 0 for error
- *
- * This can be called multiple times
- */
 int OSSL_HPKE_open(OSSL_HPKE_CTX *ctx,
                    unsigned char *pt, size_t *ptlen,
                    const unsigned char *aad, size_t aadlen,
                    const unsigned char *ct, size_t ctlen)
 {
     int erv = 1;
+    unsigned char seqbuf[12];
+    size_t seqlen = 0;
+    unsigned char nonce[12];
 
     if (ctx == NULL || pt == NULL || ptlen == NULL || *ptlen == 0
         || ct == NULL || ctlen == 0) {
         ERR_raise(ERR_LIB_CRYPTO, ERR_R_PASSED_INVALID_ARGUMENT);
         return 0;
     }
-    if (ctx->shared_secret == NULL) {
+    if (ctx->key == NULL || ctx->nonce == NULL) {
         /* need to have done an encap first, info can be NULL */
         ERR_raise(ERR_LIB_CRYPTO, ERR_R_SHOULD_NOT_HAVE_BEEN_CALLED);
         return 0;
     }
-    erv = hpke_do_rest(ctx, OSSL_HPKE_OP_DEC, (unsigned char *)ct, &ctlen,
-                       pt, ptlen,
-                       ctx->info, ctx->infolen, aad, aadlen);
+
+    if (ctx->noncelen > sizeof(nonce)) {
+        ERR_raise(ERR_LIB_CRYPTO, ERR_R_SHOULD_NOT_HAVE_BEEN_CALLED);
+        return 0;
+    }
+    seqlen = hpke_seq2buf(ctx->seq, seqbuf, sizeof(seqbuf));
+    if (seqlen == 0) {
+        erv = 0;
+        ERR_raise(ERR_LIB_CRYPTO, ERR_R_INTERNAL_ERROR);
+        goto err;
+    } else {
+        size_t sind;
+        unsigned char cv;
+
+        if (seqlen > ctx->noncelen) {
+            erv = 0;
+            ERR_raise(ERR_LIB_CRYPTO, ERR_R_INTERNAL_ERROR);
+            goto err;
+        }
+        /* non constant time - does it matter? maybe no */
+        for (sind = 0; sind != ctx->noncelen; sind++) {
+            nonce[ctx->noncelen - 1 - sind] =
+                ctx->nonce[ctx->noncelen - 1 - sind];
+            if (sind < seqlen) {
+                cv = seqbuf[seqlen - 1 - (sind % seqlen)];
+            } else {
+                cv = 0x00;
+            }
+            nonce[ctx->noncelen - 1 - sind] ^= cv;
+        }
+    }
+    erv = hpke_aead_dec(ctx->libctx, ctx->propq, ctx->suite,
+                        ctx->key, ctx->keylen, nonce, ctx->noncelen,
+                        aad, aadlen, ct, ctlen, pt, ptlen);
     if (erv != 1) {
         ERR_raise(ERR_LIB_CRYPTO, ERR_R_INTERNAL_ERROR);
         return 0;
     } else {
         ctx->seq++;
     }
+err:
+    OPENSSL_cleanse(nonce, ctx->noncelen);
     return 1;
 }
 
-/*
- * @brief generate a key pair but keep private inside API
- * @param libctx is the context to use
- * @param propq is a properties string
- * @param mode is the mode (currently unused)
- * @param suite is the ciphersuite (currently unused)
- * @param ikmlen is the length of IKM, if supplied
- * @param ikm is IKM, if supplied
- * @param publen is the size of the public key buffer (exact length on output)
- * @param pub is the public value
- * @param priv is the private key handle
- * @return 1 for good (OpenSSL style), not-1 for error
- */
-int OSSL_HPKE_keygen(OSSL_LIB_CTX *libctx, const char *propq,
-                     unsigned int mode, OSSL_HPKE_SUITE suite,
+int OSSL_HPKE_export(OSSL_HPKE_CTX *ctx,
+                     unsigned char *secret, size_t secretlen,
+                     const unsigned char *label, size_t labellen)
+{
+    int erv = 1;
+    EVP_KDF_CTX *kctx = NULL;
+    unsigned char suitebuf[6];
+    const char *mdname = NULL;
+    const OSSL_HPKE_KDF_INFO *kdf_info = NULL;
+
+    if (ctx == NULL) {
+        ERR_raise(ERR_LIB_CRYPTO, ERR_R_INTERNAL_ERROR);
+        return 0;
+    }
+    if (ctx->exportersec == NULL) {
+        ERR_raise(ERR_LIB_CRYPTO, ERR_R_INTERNAL_ERROR);
+        return 0;
+    }
+    kdf_info = ossl_HPKE_KDF_INFO_find_id(ctx->suite.kdf_id);
+    if (kdf_info == NULL) {
+        ERR_raise(ERR_LIB_CRYPTO, ERR_R_INTERNAL_ERROR);
+        return 0;
+    }
+    mdname = kdf_info->mdname;
+    kctx = ossl_kdf_ctx_create("HKDF", mdname, ctx->libctx, ctx->propq);
+    if (kctx == NULL) {
+        ERR_raise(ERR_LIB_CRYPTO, ERR_R_INTERNAL_ERROR);
+        return 0;
+    }
+    /* mode == FULL as per RFC9180 sec 5.1 */
+    suitebuf[0] = ctx->suite.kem_id / 256;
+    suitebuf[1] = ctx->suite.kem_id % 256;
+    suitebuf[2] = ctx->suite.kdf_id / 256;
+    suitebuf[3] = ctx->suite.kdf_id % 256;
+    suitebuf[4] = ctx->suite.aead_id / 256;
+    suitebuf[5] = ctx->suite.aead_id % 256;
+    erv = ossl_hpke_labeled_expand(kctx,
+                                   secret, secretlen,
+                                   ctx->exportersec, ctx->exporterseclen,
+                                   OSSL_HPKE_SEC51LABEL,
+                                   suitebuf, sizeof(suitebuf),
+                                   OSSL_HPKE_EXP_SEC_LABEL,
+                                   label, labellen);
+    EVP_KDF_CTX_free(kctx);
+    if (erv != 1) {
+        ERR_raise(ERR_LIB_CRYPTO, ERR_R_INTERNAL_ERROR);
+        return 0;
+    }
+    return 1;
+}
+
+int OSSL_HPKE_keygen(OSSL_HPKE_SUITE suite,
                      const unsigned char *ikm, size_t ikmlen,
                      unsigned char *pub, size_t *publen,
-                     EVP_PKEY **priv)
+                     EVP_PKEY **priv,
+                     OSSL_LIB_CTX *libctx, const char *propq)
 {
-    return hpke_kg_evp(libctx, propq, mode, suite,
+    return hpke_kg_evp(libctx, propq, suite,
                        ikmlen, ikm, publen, pub, priv);
 }
 
-/**
- * @brief check if a suite is supported locally
- *
- * @param suite is the suite to check
- * @return 1 for good/supported, not-1 otherwise
- */
 int OSSL_HPKE_suite_check(OSSL_HPKE_SUITE suite)
 {
     return hpke_suite_check(suite);
 }
 
-/*
- * @brief get a (possibly) random suite, public key and ciphertext for GREASErs
- *
- * As usual buffers are caller allocated and lengths on input are buffer size.
- *
- * @param libctx is the context to use
- * @param propq is a properties string
- * @param suite_in specifies the preferred suite or NULL for a random choice
- * @param suite is the chosen or random suite
- * @param pub a random value of the appropriate length for a sender public value
- * @param pub_len is the length of pub (buffer size on input)
- * @param cipher is a random value of the appropriate length for a ciphertext
- * @param cipher_len is the length of cipher
- * @return 1 for success, otherwise failure
- */
 int OSSL_HPKE_get_grease_value(OSSL_LIB_CTX *libctx, const char *propq,
                                OSSL_HPKE_SUITE *suite_in,
                                OSSL_HPKE_SUITE *suite,
-                               unsigned char *pub,
-                               size_t *pub_len,
-                               unsigned char *cipher,
-                               size_t cipher_len)
+                               unsigned char *enc,
+                               size_t *enclen,
+                               unsigned char *ct,
+                               size_t ctlen)
 {
     return hpke_get_grease_value(libctx, propq, suite_in, suite,
-                                 pub, pub_len, cipher, cipher_len);
+                                 enc, enclen, ct, ctlen);
 }
 
-/*
- * @brief map a string to a HPKE suite
- * @param str is the string value
- * @param suite is the resulting suite
- * @return 1 for success, otherwise failure
- */
 int OSSL_HPKE_str2suite(const char *str, OSSL_HPKE_SUITE *suite)
 {
-    return hpke_str2suite(str, suite);
+    return ossl_hpke_str2suite(str, suite);
 }
 
-/*
- * @brief tell the caller how big the cipertext will be
- * @param suite is the suite to be used
- * @param clearlen is the length of plaintext
- * @return the length of the related ciphertext or zero on error
- *
- * AEAD algorithms add a tag for data authentication.
- * Those are almost always, but not always, 16 octets
- * long, and who know what'll be true in the future.
- * So this function allows a caller to find out how
- * much data expansion they'll see with a given
- * suite.
- */
 size_t OSSL_HPKE_get_ciphertext_size(OSSL_HPKE_SUITE suite, size_t clearlen)
 {
     size_t enclen = 0;
@@ -2133,18 +1515,6 @@ size_t OSSL_HPKE_get_ciphertext_size(OSSL_HPKE_SUITE suite, size_t clearlen)
     return cipherlen;
 }
 
-/*
- * @brief tell the caller how big the public value ``enc`` will be
- * @param suite is the suite to be used
- * @return size of public encap or zero on error
- *
- * AEAD algorithms add a tag for data authentication.
- * Those are almost always, but not always, 16 octets
- * long, and who know what'll be true in the future.
- * So this function allows a caller to find out how
- * much data expansion they'll see with a given
- * suite.
- */
 size_t OSSL_HPKE_get_public_encap_size(OSSL_HPKE_SUITE suite)
 {
     size_t enclen = 0;
@@ -2156,23 +1526,12 @@ size_t OSSL_HPKE_get_public_encap_size(OSSL_HPKE_SUITE suite)
     return enclen;
 }
 
-/**
- * @brief recommend an IKM size in octets for a given suite
- * @param suite is the suite to be used
- * @return the recommended size or zero on error
- *
- * Today, this really only uses the KEM to recommend
- * the number of random octets to use based on the
- * size of a private value. In future, it could also
- * factor in e.g. the AEAD.
- */
-size_t OSSL_HPKE_recommend_ikmelen(OSSL_HPKE_SUITE suite)
+size_t OSSL_HPKE_get_recommended_ikmelen(OSSL_HPKE_SUITE suite)
 {
-    int kem_ind;
+    const OSSL_HPKE_KEM_INFO *kem_info = NULL;
 
     if (hpke_suite_check(suite) != 1)
         return 0;
-    if ((kem_ind = kem_iana2index(suite.kem_id)) == 0)
-        return 0;
-    return hpke_kem_tab[kem_ind].Npriv;
+    kem_info = ossl_HPKE_KEM_INFO_find_id(suite.kem_id);
+    return kem_info->Npriv;
 }
