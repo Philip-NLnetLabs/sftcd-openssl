@@ -38,8 +38,8 @@ OSSL_HPKE_CTX_get_seq, OSSL_HPKE_CTX_set_seq
                     const unsigned char *pt, size_t ptlen);
 
  int OSSL_HPKE_keygen(OSSL_HPKE_SUITE suite,
-                      const unsigned char *ikm, size_t ikmlen,
                       unsigned char *pub, size_t *publen, EVP_PKEY **priv,
+                      const unsigned char *ikm, size_t ikmlen,
                       OSSL_LIB_CTX *libctx, const char *propq);
  int OSSL_HPKE_decap(OSSL_HPKE_CTX *ctx,
                      const unsigned char *enc, size_t enclen,
@@ -437,7 +437,7 @@ This example demonstrates a minimal round-trip using HPKE.
      */
     #define LBUFSIZE 48
 
-    /* we'll do a round-trip, generating a key, encrypting and decrypting */
+    /* Do a round-trip, generating a key, encrypting and decrypting */
     int main(int argc, char **argv)
     {
         int ok = 0;
