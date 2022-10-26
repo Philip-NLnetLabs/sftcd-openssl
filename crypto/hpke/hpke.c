@@ -24,23 +24,23 @@
 #define OSSL_HPKE_MAXSIZE 512
 
 /* Define HPKE labels from RFC9180 in hex for EBCDIC compatibility */
-/**< "HPKE" - "suite_id" label for section 5.1 */
+/* "HPKE" - "suite_id" label for section 5.1 */
 static const char OSSL_HPKE_SEC51LABEL[] = "\x48\x50\x4b\x45";
-/**< "psk_id_hash" - in key_schedule_context */
+/* "psk_id_hash" - in key_schedule_context */
 static const char OSSL_HPKE_PSKIDHASH_LABEL[] = "\x70\x73\x6b\x5f\x69\x64\x5f\x68\x61\x73\x68";
-/**<  "info_hash" - in key_schedule_context */
+/*  "info_hash" - in key_schedule_context */
 static const char OSSL_HPKE_INFOHASH_LABEL[] = "\x69\x6e\x66\x6f\x5f\x68\x61\x73\x68";
-/**<  "base_nonce" - base nonce calc label */
+/*  "base_nonce" - base nonce calc label */
 static const char OSSL_HPKE_NONCE_LABEL[] = "\x62\x61\x73\x65\x5f\x6e\x6f\x6e\x63\x65";
-/**<  "exp" - internal exporter secret generation label */
+/*  "exp" - internal exporter secret generation label */
 static const char OSSL_HPKE_EXP_LABEL[] = "\x65\x78\x70";
-/**<  "sec" - external label for exporting secret */
+/*  "sec" - external label for exporting secret */
 static const char OSSL_HPKE_EXP_SEC_LABEL[] = "\x73\x65\x63";
-/**<  "key" - label for use when generating key from shared secret */
+/*  "key" - label for use when generating key from shared secret */
 static const char OSSL_HPKE_KEY_LABEL[] = "\x6b\x65\x79";
-/**<  "psk_hash" - for hashing PSK */
+/*  "psk_hash" - for hashing PSK */
 static const char OSSL_HPKE_PSK_HASH_LABEL[] = "\x70\x73\x6b\x5f\x68\x61\x73\x68";
-/**<  "secret" - for generating shared secret */
+/*  "secret" - for generating shared secret */
 static const char OSSL_HPKE_SECRET_LABEL[] = "\x73\x65\x63\x72\x65\x74";
 
 /**
@@ -48,24 +48,24 @@ static const char OSSL_HPKE_SECRET_LABEL[] = "\x73\x65\x63\x72\x65\x74";
  */
 struct ossl_hpke_ctx_st
 {
-    OSSL_LIB_CTX *libctx; /**< library context */
-    char *propq; /**< properties */
-    int mode; /**< HPKE mode */
-    OSSL_HPKE_SUITE suite; /**< suite */
-    uint64_t seq; /**< aead sequence number */
+    OSSL_LIB_CTX *libctx; /* library context */
+    char *propq; /* properties */
+    int mode; /* HPKE mode */
+    OSSL_HPKE_SUITE suite; /* suite */
+    uint64_t seq; /* aead sequence number */
     unsigned char *shared_secret; /* KEM output, zz */
     size_t shared_secretlen;
     unsigned char *key; /* final aead key */
     size_t keylen;
     unsigned char *nonce; /* aead base nonce */
     size_t noncelen;
-    unsigned char *exportersec; /**< exporter secret */
+    unsigned char *exportersec; /* exporter secret */
     size_t exporterseclen;
-    char *pskid; /**< PSK stuff */
+    char *pskid; /* PSK stuff */
     unsigned char *psk;
     size_t psklen;
-    EVP_PKEY *authpriv; /**< sender's authentication private key */
-    unsigned char *authpub; /**< auth public key */
+    EVP_PKEY *authpriv; /* sender's authentication private key */
+    unsigned char *authpub; /* auth public key */
     size_t authpublen;
     unsigned char *ikme; /* IKM for sender deterministic key gen */
     size_t ikmelen;
@@ -140,7 +140,7 @@ err:
  * @param aadlen is the length of the aad
  * @param ct is the ciphertext buffer
  * @param ctlen is the ciphertext length
- * @param pt is a caller-allocated output buffer
+ * @param pt is the output buffer
  * @param ptlen input/output, better be big enough on input, exact on output
  * @return 1 on success, 0 otherwise
  */
@@ -169,7 +169,7 @@ static int hpke_aead_dec(OSSL_LIB_CTX *libctx, const char *propq,
         goto err;
     }
     taglen = aead_info->taglen;
-    if (*ptlen < (ctlen - taglen)) {
+    if ( (*ptlen + taglen) < ctlen) {
         ERR_raise(ERR_LIB_CRYPTO, ERR_R_INTERNAL_ERROR);
         goto err;
     }
@@ -242,7 +242,7 @@ err:
  * @param aadlen is the length of the aad
  * @param pt is the plaintext buffer
  * @param ptlen is the length of pt
- * @param ct is a caller-allocated output buffer
+ * @param ct is the output buffer
  * @param ctlen input/output, needs space for tag on input, exact on output
  * @return 1 for success, 0 otherwise
  */
@@ -272,7 +272,7 @@ static int hpke_aead_enc(OSSL_LIB_CTX *libctx, const char *propq,
         goto err;
     }
     taglen = aead_info->taglen;
-    if ((taglen + ptlen) > *ctlen) {
+    if ((ptlen + taglen) > *ctlen) {
         ERR_raise(ERR_LIB_CRYPTO, ERR_R_INTERNAL_ERROR);
         goto err;
     }
@@ -452,7 +452,7 @@ static int hpke_expansion(OSSL_HPKE_SUITE suite,
  * @brief expand and XOR the 64-bit unsigned seq with (nonce) buffer
  * @param ctx is the HPKE context
  * @param buf is the buffer for the XOR'd seq and nonce
- * @param blen is the caller-allocated size of buf
+ * @param blen is the size of buf
  * @return 0 for error, otherwise blen
  */
 static size_t hpke_seqnonce2buf(OSSL_HPKE_CTX *ctx,
