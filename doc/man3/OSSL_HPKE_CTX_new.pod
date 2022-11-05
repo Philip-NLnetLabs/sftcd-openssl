@@ -89,7 +89,7 @@ OSSL_HPKE_CTX_get_seq, OSSL_HPKE_CTX_set_seq
 These functions provide an API for using the form of Hybrid Public Key
 Encryption (HPKE) defined in RFC9180. Understanding the HPKE specification 
 is likely required before using these APIs.  HPKE is used by various 
-other IETF specifications, including the (draft) TLS Encrypted Client 
+other IETF specifications, including the TLS Encrypted Client 
 Hello (ECH) specification and others.
 
 HPKE is a standardised, highly flexible construct for encrypting "to" a public
@@ -277,6 +277,7 @@ size I<ctlen> using the I<ctx> and additional authenticated data I<aad> of
 size I<aadlen>, to produce the plaintext I<pt> of size I<ptlen>.
 On input I<ptlen> should contain the maximum size of the I<pt> buffer, and
 returns the output size. An error will occur if the input I<ptlen> is too small.
+For all supported algorithms, using a buffer of size I<ctlen> will suffice.
 OSSL_HPKE_open() may be called multiple times, but as with OSSL_HPKE_seal()
 there is an internally incrementing nonce value so ciphertexts need to be
 presented in the same order as used by the OSSL_HPKE_seal().
@@ -302,7 +303,7 @@ secret, but does not wish to perform HPKE encryption.
 =head2 Sender-authenticated HPKE Modes
 
 HPKE defines modes that support KEM-based sender-authentication
-B<OSSL_HPKE_MODE_AUTH> and B<OSSL_HPKE_MODE_PSKAUTH>). This works by binding
+B<OSSL_HPKE_MODE_AUTH> and B<OSSL_HPKE_MODE_PSKAUTH>. This works by binding
 the sender's authentication private/public values into the encapsulation and
 decapsulation operations. The key used for such modes must also use the same
 KEM as used for the overall exchange. OSSL_HPKE_keygen() can be used to
@@ -358,7 +359,7 @@ decapsulation operation and is then incremented by 1 for each call to seal or
 open. (In other words, the I<seq> is a zero-based counter.)
 
 If a caller needs to determine how many calls to seal or open have been made
-the OSSL_HPKE_CTX_get_seq() API can be used to retrive the increment (in the
+the OSSL_HPKE_CTX_get_seq() API can be used to retrieve the increment (in the
 I<seq> output) that will be used in the next call to seal or open. That would
 return 0 before the first call a sender made to OSSL_HPKE_seal() and 1 after
 that first call. 
@@ -379,8 +380,8 @@ local HPKE support and/or algorithms, such as parmameter lengths.
 OSSL_HPKE_suite_check() checks if a specific B<OSSL_HPKE_SUITE> I<suite>
 is supported locally.
 
-To assist with memory alliocation, OSSL_HPKE_get_ciphertext_size() provides a
-way for the caller to know by how much cipertext will be longer than a
+To assist with memory allocation, OSSL_HPKE_get_ciphertext_size() provides a
+way for the caller to know by how much ciphertext will be longer than a
 plaintext of length I<clearlen>.  (AEAD algoriths add a data integrity tag,
 so there is a small amount of ciphertext expansion.)
 
@@ -404,7 +405,7 @@ OSSL_HPKE_str2suite() maps input I<str> strings to a B<OSSL_HPKE_SUITE> object.
 The input I<str> should be a comma-separated string with a KEM,
 KDF and AEAD name in that order, for example "x25519,hkdf-sha256,aes128gcm".
 This can be used by command line tools that accept string form names for HPKE
-codepoints. Valid names are:
+codepoints. Valid (case-insensitive) names are:
 "p256", "p384", "p521", "x25519" and "x448" for kem,
 "hkdf-SHA256", "hkdf-SHA384" and "hkdf-SHA512" for kdf, and
 "aes-gcm-128", "aes-gcm-256" and "chacha20-poly1305" for aead.
@@ -510,8 +511,7 @@ The RFC9180 specification: https://datatracker.ietf.org/doc/rfc9180/
 
 =head1 HISTORY
 
-Initially developed by Stephen Farrell supported by OTF via
-the DEfO project: https://defo.ie/
+This functionality described here was added in OpenSSL 3.2.
 
 =head1 COPYRIGHT
 

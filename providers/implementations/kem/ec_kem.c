@@ -349,7 +349,7 @@ static int dhkem_extract_and_expand(EVP_KDF_CTX *kctx,
     if (prklen > sizeof(prk))
         return 0;
 
-    suiteid[0] = (kemid >> 8) &0xff;
+    suiteid[0] = (kemid >> 8) & 0xff;
     suiteid[1] = kemid & 0xff;
 
     ret = ossl_hpke_labeled_extract(kctx, prk, prklen,
@@ -422,14 +422,14 @@ int ossl_ec_dhkem_derive_private(EC_KEY *ec, BIGNUM *priv,
 
     order = EC_GROUP_get0_order(EC_KEY_get0_group(ec));
     do {
-        if (!ossl_hpke_labeled_expand(kdfctx, privbuf, info->Npriv,
+        if (!ossl_hpke_labeled_expand(kdfctx, privbuf, info->Nsk,
                                       prk, info->Nsecret,
                                       LABEL_KEM, suiteid, sizeof(suiteid),
                                       OSSL_DHKEM_LABEL_CANDIDATE,
                                       &counter, 1))
             goto err;
         privbuf[0] &= info->bitmask;
-        if (BN_bin2bn(privbuf, info->Npriv, priv) == NULL)
+        if (BN_bin2bn(privbuf, info->Nsk, priv) == NULL)
             goto err;
         if (counter == 0xFF) {
             ERR_raise(ERR_LIB_PROV, PROV_R_FAILED_TO_GENERATE_KEY);
@@ -470,7 +470,7 @@ static EC_KEY *derivekey(PROV_EC_CTX *ctx,
 
     /* Generate a random seed if there is no input ikm */
     if (seed == NULL || seedlen == 0) {
-        seedlen = ctx->info->Npriv;
+        seedlen = ctx->info->Nsk;
         if (seedlen > sizeof(tmpbuf))
             goto err;
         if (RAND_priv_bytes_ex(ctx->libctx, tmpbuf, seedlen, 0) <= 0)
@@ -572,7 +572,7 @@ static int derive_secret(PROV_EC_CTX *ctx, unsigned char *secret,
     size_t kemctxlen = 0, dhkmlen = 0;
     const OSSL_HPKE_KEM_INFO *info = ctx->info;
     size_t encodedpublen = info->Npk;
-    size_t encodedprivlen = info->Npriv;
+    size_t encodedprivlen = info->Nsk;
     int auth = ctx->sender_authkey != NULL;
 
     if (!generate_ecdhkm(privkey1, peerkey1, dhkm, sizeof(dhkm), encodedprivlen))
