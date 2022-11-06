@@ -145,8 +145,6 @@ struct sslapitest_log_counts {
     unsigned int exporter_secret_count;
 };
 
-#undef HARDCODED
-#ifndef HARDCODED
 #ifndef OSSL_NO_USABLE_ECH
 
 #define OSSL_ECH_MAX_LINELEN 1000 /**< for a sanity check */
@@ -190,7 +188,6 @@ out:
     if (in) BIO_free_all(in);
     return(NULL);
 }
-#endif
 #endif
 
 static int hostname_cb(SSL *s, int *al, void *arg)
@@ -1973,34 +1970,12 @@ static int execute_test_session(int maxprot, int use_int_cache,
         }
     }
     if (maxprot == TLS1_3_VERSION && have25519) {
-#ifdef HARDCODED
-        const char *echkeypair="-----BEGIN PRIVATE KEY-----\n" \
-           "MC4CAQAwBQYDK2VuBCIEICjd4yGRdsoP9gU7YT7My8DHx1Tjme8GYDXrOMCi8v1V\n" \
-           "-----END PRIVATE KEY-----\n" \
-           "-----BEGIN ECHCONFIG-----\n" \
-           "AD7+DQA65wAgACA8wVN2BtscOl3vQheUzHeIkVmKIiydUhDCliA4iyQRCwAEAAEAAQALZXhhbXBsZS5jb20AAA==\n" \
-           "-----END ECHCONFIG-----";
-        size_t echkeypair_len=0;
-#endif
         char *echkeyfile=NULL;
         char *echconfiglist=NULL;
         int echcount=0;
         size_t echconfig_len=0;
 
         test_printf_stdout("Running real ECH, fips=%d\n",is_fips);
-
-#ifdef HARDCODED
-        echkeypair_len=strlen(echkeypair);
-        echconfiglist=strdup("AD7+DQA65wAgACA8wVN2BtscOl3vQheUzHeIkVmKIiydUhDCliA4iyQRCwAEAAEAAQALZXhhbXBsZS5jb20AAA==");
-        echconfig_len=strlen(echconfiglist);
-        if (SSL_CTX_ech_server_enable_buffer(sctx,
-                    (const unsigned char*) echkeypair,
-                    echkeypair_len)!=1) {
-            OPENSSL_free(echkeyfile);
-            OPENSSL_free(echconfiglist);
-            return 0;
-        }
-#else
         /* read pre-cooked ECH private/ECHConfigList */
         echkeyfile=test_mk_file_path(certsdir, "echconfig.pem");
         echconfiglist=echconfiglist_from_PEM(echkeyfile);
@@ -2014,7 +1989,6 @@ static int execute_test_session(int maxprot, int use_int_cache,
             OPENSSL_free(echconfiglist);
             return 0;
         }
-#endif
         if (SSL_CTX_ech_add(cctx, OSSL_ECH_FMT_GUESS, 
                echconfig_len, echconfiglist,
                &echcount)!=1) {
@@ -10284,158 +10258,6 @@ end:
 }
 #endif /* OSSL_NO_USABLE_TLS1_3 */
 
-#ifndef OSSL_NO_USABLE_ECH
-
-enum OSSLTEST_ECH_runOrder {    /* Shuffle to preferred order */
-  OSSLTEST_ECH_B64_GUESS,
-  OSSLTEST_ECH_B64_BASE64,
-  OSSLTEST_ECH_B64_GUESS_XS_COUNT,
-  OSSLTEST_ECH_B64_GUESS_LO_COUNT,
-  OSSLTEST_ECH_B64_JUNK_GUESS,
-
-  OSSLTEST_ECH_NTESTS        /* Keep NTESTS last */
-};
-
-static int test_ech_add(int idx)
-{
-    SSL_CTX *cctx = NULL, *sctx = NULL, *sctx2 = NULL;
-    SSL *clientssl = NULL, *serverssl = NULL;
-    int testresult = 0;        /* assume failure */
-    int echcount = 0;
-    int returned;
-
-#if 0
-    /*
-     * This ECHConfigList has only one entry.
-     */
-    char echconfig[] =
-      "ADX+CgAxLwAgACAPM+mZOcezv6GuQIQ8ZVHT+Hube8VZq+pAbXphNU3nSwAEAAE"\
-      "AAQAAAAAAAA==";
-#endif
-
-    /* 
-     * This ECHConfigList has 6 entries with different versions,
-     * [13,10,9,13,10,13] - since our runtime no longer supports
-     * version 9 or 10, we should see 3 configs loaded.
-     * Once we drop support for draft-10, then it'll be 3 and
-     * we'll need to change the expected echcount below.
-     */
-    char echconfig[]=
-        "AXn+DQA6xQAgACBm54KSIPXu+pQq2oY183wt3ybx7CKbBYX0ogPq5u6FegAEAAE"\
-        "AAQALZXhhbXBsZS5jb20AAP4KADzSACAAIIP+0Qt0WGBF3H5fz8HuhVRTCEMuHS"\
-        "4Khu6ibR/6qER4AAQAAQABAAAAC2V4YW1wbGUuY29tAAD+CQA7AAtleGFtcGxlL"\
-        "mNvbQAgoyQr+cP8mh42znOp1bjPxpLCBi4A0ftttr8MPXRJPBcAIAAEAAEAAQAA"\
-        "AAD+DQA6QwAgACB3xsNUtSgipiYpUkW6OSrrg03I4zIENMFa0JR2+Mm1WwAEAAE"\
-        "AAQALZXhhbXBsZS5jb20AAP4KADwDACAAIH0BoAdiJCX88gv8nYpGVX5BpGBa9y"\
-        "T0Pac3Kwx6i8URAAQAAQABAAAAC2V4YW1wbGUuY29tAAD+DQA6QwAgACDcZIAx7"\
-        "OcOiQuk90VV7/DO4lFQr5I3Zw9tVbK8MGw1dgAEAAEAAQALZXhhbXBsZS5jb20A"\
-        "AA==";
-    size_t echconfig_len=strlen(echconfig);
-
-    /* Generate fresh context pair for each test with TLSv1.3 as a minimum */
-    if (!TEST_true(create_ssl_ctx_pair(libctx, TLS_server_method(),
-                                       TLS_client_method(), TLS1_3_VERSION, 0,
-                                       &sctx2, &cctx, cert, privkey))) {
-       TEST_info("test_ech_add: Failed to create context pair for test iteration %d\n", idx);
-       goto end;
-    }
-    switch (idx) {
-    case OSSLTEST_ECH_B64_GUESS:
-        /* Valid echconfig */
-        returned = SSL_CTX_ech_add(cctx,
-               OSSL_ECH_FMT_GUESS, /* unspecified format */
-               echconfig_len, echconfig,
-               &echcount);   /* returned count of echconfigs */
-        if (!TEST_int_eq(returned, 1)) {
-            TEST_info("OSSLTEST_ECH_B64_GUESS: failure for valid echconfig and length\n");
-            goto end;
-        }
-        if (!TEST_int_eq(echcount, 3)) {
-            TEST_info("OSSLTEST_ECH_B64_GUESS: incorrect ECH count\n");
-            goto end;
-        }
-        break;
-
-    case OSSLTEST_ECH_B64_BASE64:
-        /* Valid echconfig */
-        returned = SSL_CTX_ech_add(cctx,
-               OSSL_ECH_FMT_B64TXT, /* BASE64 format */
-               echconfig_len, echconfig,
-               &echcount);   /* returned count of echconfigs */
-        if (!TEST_int_eq(returned, 1)) {
-            TEST_info("OSSLTEST_ECH_B64_BASE64: failure for valid echconfig and length\n");
-            goto end;
-        }
-        if (!TEST_int_eq(echcount, 3)) {
-            TEST_info("OSSLTEST_ECH_B64_BASE64: incorrect ECH count\n");
-            goto end;
-        }
-      break;
-
-    case OSSLTEST_ECH_B64_GUESS_XS_COUNT:
-        /* 
-         * Valid echconfig, excess length but just by one octet
-         * which will be ok since strings have that added NUL
-         * octet. If the excess was >1 then the caller is the
-         * one making the error.
-         */
-        returned = SSL_CTX_ech_add(cctx,
-               OSSL_ECH_FMT_GUESS, /* unspecified format */
-               echconfig_len+1, echconfig,
-               &echcount);   /* returned count of echconfigs */
-        if (!TEST_int_ne(returned, 1)) {
-            TEST_info("OSSLTEST_ECH_B64_GUESS_XS_COUNT: success despite excess length (%d/%d)\n",
-              (int)echconfig_len+1, (int)echconfig_len);
-            goto end;
-        }
-        if (!TEST_int_eq(echcount, 0)) {
-            TEST_info("OSSLTEST_ECH_B64_GUESS_XS_COUNT: ECH count (%d) should be zero\n", echcount);
-            goto end;
-        }
-      break;
-
-    case OSSLTEST_ECH_B64_GUESS_LO_COUNT:
-        /* Valid echconfig, short length */
-        returned = SSL_CTX_ech_add(cctx,
-               OSSL_ECH_FMT_GUESS, /* unspecified format */
-               echconfig_len/2, echconfig,
-               &echcount);   /* returned count of echconfigs */
-        if (!TEST_int_ne(returned, 1)) {
-            TEST_info("OSSLTEST_ECH_B64_GUESS_LO_COUNT: success despite short length (%d/%d)\n",
-              (int)echconfig_len/2, (int)echconfig_len);
-            goto end;
-          }
-      break;
-
-    case OSSLTEST_ECH_B64_JUNK_GUESS:
-        /* Junk echconfig */
-        returned = SSL_CTX_ech_add(cctx,
-               OSSL_ECH_FMT_GUESS, /* unspecified format */
-               18, "DUMMDUMM;DUMMYDUMM",
-               &echcount);   /* returned count of echconfigs */
-        if (!TEST_int_ne(returned, 1)) {
-            TEST_info("OSSLTEST_ECH_B64_JUNK_GUESS: success despite junk echconfig\n");
-            goto end;
-        }
-      break;
-
-    default:
-        TEST_error("Bad test index\n");
-        goto end;
-    }
-
-    testresult = 1;        /* explicit success */
-
-end:
-    SSL_free(serverssl);
-    SSL_free(clientssl);
-    SSL_CTX_free(sctx2);
-    SSL_CTX_free(sctx);
-    SSL_CTX_free(cctx);        /* TBD: ensure that this frees any echconfig storage */
-    return testresult;
-}
-#endif    /* OSSL_NO_USABLE_ECH */
-
 OPT_TEST_DECLARE_USAGE("certfile privkeyfile srpvfile tmpfile provider config dhfile\n")
 
 int setup_tests(void)
@@ -10698,9 +10520,6 @@ int setup_tests(void)
 #ifndef OSSL_NO_USABLE_TLS1_3
     ADD_TEST(test_sni_tls13);
     ADD_ALL_TESTS(test_ticket_lifetime, 2);
-#endif
-#ifndef OSSL_NO_USABLE_ECH
-    ADD_ALL_TESTS(test_ech_add, 5);
 #endif
     ADD_TEST(test_inherit_verify_param);
     ADD_TEST(test_set_alpn);
