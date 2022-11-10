@@ -139,7 +139,7 @@ err:
  * @param aad is the additional authenticated data
  * @param aadlen is the length of the aad
  * @param ct is the ciphertext buffer
- * @param ctlen is the ciphertext length
+ * @param ctlen is the ciphertext length (including tag).
  * @param pt is the output buffer
  * @param ptlen input/output, better be big enough on input, exact on output
  * @return 1 on success, 0 otherwise
@@ -279,7 +279,7 @@ static int hpke_aead_enc(OSSL_LIB_CTX *libctx, const char *propq,
         goto err;
     }
     /* Create and initialise the context */
-    if (!(ctx = EVP_CIPHER_CTX_new())) {
+    if ((ctx = EVP_CIPHER_CTX_new()) == NULL) {
         ERR_raise(ERR_LIB_CRYPTO, ERR_R_INTERNAL_ERROR);
         goto err;
     }
@@ -415,10 +415,14 @@ static int hpke_random_suite(OSSL_LIB_CTX *libctx,
  * So this function allows a caller to find out how
  * much data expansion they will see with a given suite.
  *
+ * "enc" is the name used in RFC9180 for the encapsulated
+ * public value of the sender, who calls OSSL_HPKE_seal(),
+ * that is sent to the recipient, who calls OSSL_HPKE_open().
+ *
  * @param suite is the suite to be used
  * @param enclen points to what will be enc length
  * @param clearlen is the length of plaintext
- * @param cipherlen points to what will be ciphertext length
+ * @param cipherlen points to what will be ciphertext length (including tag)
  * @return 1 for success, 0 otherwise
  */
 static int hpke_expansion(OSSL_HPKE_SUITE suite,
@@ -510,7 +514,7 @@ static int hpke_encap(OSSL_HPKE_CTX *ctx, unsigned char *enc, size_t *enclen,
     kem_info = ossl_HPKE_KEM_INFO_find_id(ctx->suite.kem_id);
     if (kem_info == NULL) {
         ERR_raise(ERR_LIB_CRYPTO, ERR_R_INTERNAL_ERROR);
-        goto err;
+        return 0;
     }
     if (hpke_kem_id_nist_curve(ctx->suite.kem_id) == 1) {
         pkR = EVP_PKEY_new_raw_nist_public_key(ctx->libctx, ctx->propq,
@@ -562,6 +566,7 @@ static int hpke_encap(OSSL_HPKE_CTX *ctx, unsigned char *enc, size_t *enclen,
     if (EVP_PKEY_encapsulate(pctx, enc, enclen, ctx->shared_secret,
                              &ctx->shared_secretlen) != 1) {
         ctx->shared_secretlen = 0;
+        OPENSSL_free(ctx->shared_secret);
         ctx->shared_secret = NULL;
         ERR_raise(ERR_LIB_CRYPTO, ERR_R_INTERNAL_ERROR);
         goto err;
@@ -650,9 +655,8 @@ static int hpke_decap(OSSL_HPKE_CTX *ctx,
         goto err;
     }
     ctx->shared_secret = OPENSSL_malloc(lsslen);
-    if (ctx->shared_secret == NULL) {
+    if (ctx->shared_secret == NULL)
         goto err;
-    }
     if (EVP_PKEY_decapsulate(pctx, ctx->shared_secret, &lsslen,
                              enc, enclen) != 1) {
         ERR_raise(ERR_LIB_CRYPTO, ERR_R_INTERNAL_ERROR);
@@ -664,8 +668,8 @@ static int hpke_decap(OSSL_HPKE_CTX *ctx,
 err:
     EVP_PKEY_CTX_free(pctx);
     EVP_PKEY_free(spub);
-    if (erv == 0 && lsslen != 0 && ctx->shared_secret != NULL) {
-        OPENSSL_clear_free(ctx->shared_secret, lsslen);
+    if (erv == 0) {
+        OPENSSL_free(ctx->shared_secret);
         ctx->shared_secret = NULL;
         ctx->shared_secretlen = 0;
     }
@@ -796,9 +800,8 @@ static int hpke_do_middle(OSSL_HPKE_CTX *ctx,
         /* we only need nonce/key for non export AEADs */
         ctx->noncelen = aead_info->Nn;
         ctx->nonce = OPENSSL_malloc(ctx->noncelen);
-        if (ctx->nonce == NULL) {
+        if (ctx->nonce == NULL)
             goto err;
-        }
         if (ossl_hpke_labeled_expand(kctx, ctx->nonce, ctx->noncelen,
                                      secret, secretlen, OSSL_HPKE_SEC51LABEL,
                                      suitebuf, sizeof(suitebuf),
@@ -809,9 +812,8 @@ static int hpke_do_middle(OSSL_HPKE_CTX *ctx,
         }
         ctx->keylen = aead_info->Nk;
         ctx->key = OPENSSL_malloc(ctx->keylen);
-        if (ctx->key == NULL) {
+        if (ctx->key == NULL)
             goto err;
-        }
         if (ossl_hpke_labeled_expand(kctx, ctx->key, ctx->keylen,
                                      secret, secretlen, OSSL_HPKE_SEC51LABEL,
                                      suitebuf, sizeof(suitebuf),
@@ -910,9 +912,8 @@ int OSSL_HPKE_CTX_set1_psk(OSSL_HPKE_CTX *ctx,
     /* free previous values if any */
     OPENSSL_clear_free(ctx->psk, ctx->psklen);
     ctx->psk = OPENSSL_malloc(psklen);
-    if (ctx->psk == NULL) {
+    if (ctx->psk == NULL)
         return 0;
-    }
     memcpy(ctx->psk, psk, psklen);
     ctx->psklen = psklen;
     OPENSSL_free(ctx->pskid);
